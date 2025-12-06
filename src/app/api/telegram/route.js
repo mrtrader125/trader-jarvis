@@ -4,11 +4,9 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Simple in-memory conversation store per Telegram chat
-// NOTE: On serverless this can reset if the instance is recycled.
-// For persistent memory, later we can plug in a real database.
+// In-memory conversation per Telegram chat
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
-const MAX_MESSAGES = 12; // how many recent turns to keep in context
+const MAX_MESSAGES = 12;
 
 function getSystemPrompt() {
   return {
@@ -22,42 +20,47 @@ function getSystemPrompt() {
 }
 
 async function askJarvisWithMemory(chatId, userText) {
-  // Get existing history for this chat
+  // Get existing history
   let history = conversations.get(chatId) || [];
 
   // Add the new user message
   history = [...history, { role: "user", content: userText }];
 
-  // Trim to last N messages to avoid huge context
+  // Trim to last N messages
   if (history.length > MAX_MESSAGES) {
     history = history.slice(history.length - MAX_MESSAGES);
   }
 
-  // Build messages for Groq: system + history
   const messagesForGroq = [getSystemPrompt(), ...history];
 
-  const completion = await groq.chat.completions.create({
-    model: "llama-3.1-70b-versatile",
-    messages: messagesForGroq,
-    temperature: 0.7,
-  });
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.1-70b-versatile",
+      messages: messagesForGroq,
+      temperature: 0.7,
+    });
 
-  const reply =
-    completion.choices?.[0]?.message?.content?.trim() ||
-    "Bro, my brain glitched for a sec. Try again.";
+    const reply =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      "Bro, my brain glitched for a sec. Try again.";
 
-  // Add assistant reply to history
-  history = [...history, { role: "assistant", content: reply }];
+    // Save assistant reply
+    history = [...history, { role: "assistant", content: reply }];
 
-  // Trim again if needed
-  if (history.length > MAX_MESSAGES) {
-    history = history.slice(history.length - MAX_MESSAGES);
+    if (history.length > MAX_MESSAGES) {
+      history = history.slice(history.length - MAX_MESSAGES);
+    }
+
+    conversations.set(chatId, history);
+
+    return reply;
+  } catch (err) {
+    console.error("Groq error in Telegram route:", err);
+    return (
+      "Bro, my brain hit an error talking to the server. " +
+      "Check your internet or try again in a bit."
+    );
   }
-
-  // Save back to memory
-  conversations.set(chatId, history);
-
-  return reply;
 }
 
 async function sendTelegramMessage(chatId, text) {
@@ -69,18 +72,24 @@ async function sendTelegramMessage(chatId, text) {
 
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
 
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "Markdown",
-    }),
-  });
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Failed to send Telegram message:", err);
+  }
 }
 
 export async function POST(req) {
+  let chatId = null;
+
   try {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
@@ -89,16 +98,16 @@ export async function POST(req) {
     }
 
     const update = await req.json();
-
     const message = update.message;
+
     if (!message || !message.text) {
       return new Response("No message", { status: 200 });
     }
 
-    const chatId = message.chat.id;
+    chatId = message.chat.id;
     const text = message.text.trim();
 
-    // Handle /start
+    // /start = intro (no memory)
     if (text === "/start") {
       await sendTelegramMessage(
         chatId,
@@ -107,7 +116,7 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // Handle /reset to clear memory
+    // /reset = wipe memory
     if (text === "/reset") {
       conversations.delete(chatId);
       await sendTelegramMessage(
@@ -117,7 +126,7 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // Normal message: call Jarvis with memory
+    // Normal message → Jarvis with memory
     const reply = await askJarvisWithMemory(chatId, text);
 
     await sendTelegramMessage(chatId, reply);
@@ -125,7 +134,16 @@ export async function POST(req) {
     return new Response("ok", { status: 200 });
   } catch (err) {
     console.error("Telegram webhook error:", err);
-    // Return 200 so Telegram doesn't keep retrying aggressively
+
+    // Try to at least tell the user something
+    if (chatId) {
+      await sendTelegramMessage(
+        chatId,
+        "Bro, something broke on the server side. Try again in a minute."
+      );
+    }
+
+    // Always 200 so Telegram doesn't spam retries
     return new Response("error", { status: 200 });
   }
 }
