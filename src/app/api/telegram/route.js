@@ -1,6 +1,6 @@
 // Telegram <-> Jarvis bridge
 // - Text + short-term memory per chat
-// - Voice messages via Deepgram STT
+// - Voice messages via Deepgram STT (binary audio)
 // - Uses your existing /api/chat as Jarvis brain
 
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
@@ -32,33 +32,33 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
-// Transcribe Telegram voice file using Deepgram
-async function transcribeAudioFromUrl(fileUrl) {
+// Transcribe Telegram voice file using Deepgram (sending audio bytes)
+async function transcribeAudioBinary(audioArrayBuffer) {
   const dgKey = process.env.DEEPGRAM_API_KEY;
   if (!dgKey) {
     console.error("Missing DEEPGRAM_API_KEY");
-    return null;
+    return "__NO_DEEPGRAM_KEY__";
   }
 
   try {
-    const res = await fetch(
+    const dgRes = await fetch(
       "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
       {
         method: "POST",
         headers: {
           Authorization: `Token ${dgKey}`,
-          "Content-Type": "application/json",
+          "Content-Type": "audio/ogg", // Telegram voice is OGG/OPUS
         },
-        body: JSON.stringify({ url: fileUrl }),
+        body: Buffer.from(audioArrayBuffer),
       }
     );
 
-    if (!res.ok) {
-      console.error("Deepgram error:", res.status, await res.text());
+    if (!dgRes.ok) {
+      console.error("Deepgram error:", dgRes.status, await dgRes.text());
       return null;
     }
 
-    const data = await res.json();
+    const data = await dgRes.json();
     const transcript =
       data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
     return transcript.trim() || null;
@@ -135,7 +135,7 @@ export async function POST(req) {
 
     chatId = message.chat.id;
 
-    // /id -> show chat id (useful for reminders later)
+    // /id -> show chat id
     if (message.text && message.text.trim() === "/id") {
       await sendTelegramMessage(chatId, `Your chat id is: \`${chatId}\``);
       return new Response("ok", { status: 200 });
@@ -160,7 +160,7 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // --- NEW: handle voice message ---
+    // --- Voice message handling ---
     if (message.voice) {
       const fileId = message.voice.file_id;
 
@@ -182,8 +182,29 @@ export async function POST(req) {
         const filePath = fileData.result.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
 
-        // 2) Transcribe via Deepgram
-        const transcript = await transcribeAudioFromUrl(fileUrl);
+        // 2) Download the audio ourselves
+        const audioRes = await fetch(fileUrl);
+        if (!audioRes.ok) {
+          console.error("Error downloading audio from Telegram:", audioRes.status);
+          await sendTelegramMessage(
+            chatId,
+            "Bro, I couldn't download that voice clearly. Can you send it again or type it?"
+          );
+          return new Response("ok", { status: 200 });
+        }
+
+        const audioArrayBuffer = await audioRes.arrayBuffer();
+
+        // 3) Transcribe via Deepgram (binary audio)
+        const transcript = await transcribeAudioBinary(audioArrayBuffer);
+
+        if (transcript === "__NO_DEEPGRAM_KEY__") {
+          await sendTelegramMessage(
+            chatId,
+            "Bro, my speech brain (Deepgram) isn't configured on the server yet. Ask future-you to set DEEPGRAM_API_KEY in Vercel."
+          );
+          return new Response("ok", { status: 200 });
+        }
 
         if (!transcript) {
           await sendTelegramMessage(
@@ -193,10 +214,10 @@ export async function POST(req) {
           return new Response("ok", { status: 200 });
         }
 
-        // 3) Send transcript through Jarvis brain
+        // 4) Send transcript through Jarvis brain
         const reply = await askJarvisViaChatAPI(
           chatId,
-          `(voice message) ${transcript}`,
+          `(voice) ${transcript}`,
           req
         );
 
