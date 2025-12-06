@@ -1,3 +1,4 @@
+// src/app/api/telegram/route.js
 // Telegram <-> Jarvis bridge
 // - Text + short-term memory per chat
 // - Voice messages via Deepgram STT (binary audio)
@@ -72,8 +73,10 @@ async function transcribeAudioBinary(audioArrayBuffer) {
 async function askJarvisViaChatAPI(chatId, userText, req) {
   let history = conversations.get(chatId) || [];
 
+  // Add current user message
   history = [...history, { role: "user", content: userText }];
 
+  // Trim short-term memory
   if (history.length > MAX_MESSAGES) {
     history = history.slice(history.length - MAX_MESSAGES);
   }
@@ -99,6 +102,7 @@ async function askJarvisViaChatAPI(chatId, userText, req) {
       data.reply ||
       "Bro, my brain glitched for a sec while talking to the main server. Try again.";
 
+    // Add assistant reply to short-term memory
     history = [...history, { role: "assistant", content: reply }];
 
     if (history.length > MAX_MESSAGES) {
@@ -135,7 +139,7 @@ export async function POST(req) {
 
     chatId = message.chat.id;
 
-    // /id -> show chat id
+    // /id -> show chat id (for reminders etc.)
     if (message.text && message.text.trim() === "/id") {
       await sendTelegramMessage(chatId, `Your chat id is: \`${chatId}\``);
       return new Response("ok", { status: 200 });
@@ -185,7 +189,10 @@ export async function POST(req) {
         // 2) Download the audio ourselves
         const audioRes = await fetch(fileUrl);
         if (!audioRes.ok) {
-          console.error("Error downloading audio from Telegram:", audioRes.status);
+          console.error(
+            "Error downloading audio from Telegram:",
+            audioRes.status
+          );
           await sendTelegramMessage(
             chatId,
             "Bro, I couldn't download that voice clearly. Can you send it again or type it?"
