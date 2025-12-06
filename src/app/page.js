@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 
 export default function Home() {
   const [messages, setMessages] = useState([
@@ -95,6 +96,14 @@ export default function Home() {
             <span className="rounded-full bg-slate-900/80 px-3 py-1 text-slate-400 ring-1 ring-slate-700">
               V1 · Chat only · More coming soon
             </span>
+
+            {/* Journal link */}
+            <Link
+              href="/journal"
+              className="rounded-full bg-indigo-500/15 px-3 py-1 font-medium text-indigo-200 ring-1 ring-indigo-500/60 hover:bg-indigo-500/25 transition"
+            >
+              Trading Journal →
+            </Link>
           </div>
         </header>
 
