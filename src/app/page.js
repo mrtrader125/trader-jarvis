@@ -3,6 +3,73 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
+const CHECKIN_STORAGE_KEY = "jarvis-daily-checkins-v1";
+
+function computeStatusFromCheckin(checkin) {
+  if (!checkin) return null;
+
+  const sleepHours = Number(checkin.sleepHours || 0);
+  const { sleepQuality, mood, stress, energy, focus, urgeToTrade } = checkin;
+
+  // --- Hard "no trade" signals ---
+  const veryTired = sleepHours > 0 && sleepHours < 4;
+  const awfulSleep = sleepQuality === "Very bad";
+  const extremeUrge = urgeToTrade === "Extreme / Revenge mode";
+  const veryHighStress = stress === "Very high";
+  const veryLowEnergy = energy === "Very low";
+  const veryLowFocus = focus === "Very low";
+
+  if (
+    veryTired ||
+    awfulSleep ||
+    extremeUrge ||
+    veryHighStress ||
+    veryLowEnergy ||
+    veryLowFocus
+  ) {
+    return {
+      level: "block", // red
+      label: "Today: NO TRADING",
+      detail:
+        "Your state is risky for trading (fatigue, stress or revenge energy). Focus on recovery, journaling and routine instead of taking risk.",
+    };
+  }
+
+  // --- Caution / reduced risk ---
+  const lowSleep = sleepHours > 0 && sleepHours < 6;
+  const badSleep = sleepQuality === "Bad";
+  const highStress = stress === "High";
+  const lowEnergy = energy === "Low";
+  const lowFocus = focus === "Low";
+  const weirdMood = ["Anxious", "Frustrated", "Angry", "Sad"].includes(mood);
+  const highUrge = urgeToTrade === "High" || urgeToTrade === "Very low";
+
+  if (
+    lowSleep ||
+    badSleep ||
+    highStress ||
+    lowEnergy ||
+    lowFocus ||
+    weirdMood ||
+    highUrge
+  ) {
+    return {
+      level: "caution", // amber
+      label: "Today: CAREFUL · Reduce risk",
+      detail:
+        "Trade smaller and less. Focus on A+ setups only, limit number of trades, and stop early if you feel emotions spiking.",
+    };
+  }
+
+  // --- Good to go ---
+  return {
+    level: "good", // green
+    label: "Today: FIT TO TRADE",
+    detail:
+      "Your state looks solid — calm, rested and focused enough. Still follow your rules: A+ setups only, no forcing trades.",
+  };
+}
+
 export default function Home() {
   const [messages, setMessages] = useState([
     {
@@ -15,11 +82,34 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
 
+  // New: today's mental status from /checkin
+  const [todayStatus, setTodayStatus] = useState(null);
+
+  // Scroll chat to bottom on new messages/loading
   useEffect(() => {
     if (bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, loading]);
+
+  // Load latest check-in from localStorage and compute status
+  useEffect(() => {
+    try {
+      if (typeof window === "undefined") return;
+      const raw = window.localStorage.getItem(CHECKIN_STORAGE_KEY);
+      if (!raw) return;
+
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed) || parsed.length === 0) return;
+
+      // stored newest first in /checkin
+      const latest = parsed[0];
+      const status = computeStatusFromCheckin(latest);
+      setTodayStatus(status);
+    } catch (e) {
+      console.error("Failed to read daily check-in", e);
+    }
+  }, []);
 
   const sendMessage = async () => {
     const trimmed = input.trim();
@@ -70,34 +160,54 @@ export default function Home() {
     }
   };
 
+  // Colors for status pill
+  const statusStyles =
+    todayStatus?.level === "good"
+      ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/60"
+      : todayStatus?.level === "caution"
+      ? "bg-amber-500/15 text-amber-200 ring-amber-500/60"
+      : todayStatus?.level === "block"
+      ? "bg-rose-500/15 text-rose-200 ring-rose-500/60"
+      : "bg-slate-900/80 text-slate-400 ring-slate-700";
+
   return (
     <div className="flex min-h-screen items-center justify-center px-2 py-4 sm:px-4">
       <div className="flex w-full max-w-5xl flex-col gap-3 sm:gap-4">
         {/* Top bar / title */}
         <header className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-800/80 bg-slate-950/70 px-4 py-3 shadow-lg shadow-black/40 backdrop-blur sm:flex-row sm:items-center sm:px-6">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/15 ring-2 ring-emerald-500/60">
-              <span className="text-xl">⚡</span>
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/15 ring-2 ring-emerald-500/60">
+                <span className="text-xl">⚡</span>
+              </div>
+              <div>
+                <h1 className="text-base font-semibold text-slate-50 sm:text-lg">
+                  JARVIS V1 · Trader Companion
+                </h1>
+                <p className="text-xs text-slate-400 sm:text-sm">
+                  Your friendly co-pilot for trading, emotions & routine.
+                </p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-base font-semibold text-slate-50 sm:text-lg">
-                JARVIS V1 · Trader Companion
-              </h1>
-              <p className="text-xs text-slate-400 sm:text-sm">
-                Your friendly co-pilot for trading, emotions & routine.
+
+            {/* New: today status detail below title */}
+            {todayStatus && (
+              <p className="text-[0.7rem] text-slate-400 sm:text-xs pl-12 sm:pl-13">
+                {todayStatus.detail}
               </p>
-            </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 text-xs sm:text-[0.7rem]">
             <span className="rounded-full bg-emerald-500/10 px-3 py-1 font-medium text-emerald-300 ring-1 ring-emerald-500/50">
               Live · Connected
             </span>
-            <span className="rounded-full bg-slate-900/80 px-3 py-1 text-slate-400 ring-1 ring-slate-700">
-              V1 · Chat only · More coming soon
+
+            {/* Today status pill */}
+            <span className={`rounded-full px-3 py-1 font-medium ring-1 ${statusStyles}`}>
+              {todayStatus ? todayStatus.label : "No check-in for today yet"}
             </span>
 
-            {/* New: Daily check-in link */}
             <Link
               href="/checkin"
               className="rounded-full bg-amber-500/15 px-3 py-1 font-medium text-amber-200 ring-1 ring-amber-500/60 hover:bg-amber-500/25 transition"
@@ -105,7 +215,6 @@ export default function Home() {
               Daily Check-in
             </Link>
 
-            {/* Journal link */}
             <Link
               href="/journal"
               className="rounded-full bg-indigo-500/15 px-3 py-1 font-medium text-indigo-200 ring-1 ring-indigo-500/60 hover:bg-indigo-500/25 transition"
