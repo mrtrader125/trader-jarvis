@@ -24,6 +24,11 @@ export default function JournalPage() {
   const [trades, setTrades] = useState([]);
   const [form, setForm] = useState(defaultForm);
 
+  // New: state for Jarvis analysis
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisText, setAnalysisText] = useState("");
+  const [analysisError, setAnalysisError] = useState("");
+
   // Load from localStorage on mount
   useEffect(() => {
     try {
@@ -135,6 +140,74 @@ export default function JournalPage() {
     setTrades((prev) => prev.filter((t) => t.id !== id));
   };
 
+  // ---- NEW: ask Jarvis to analyze trades ----
+  const handleAskJarvis = async () => {
+    if (!trades.length) {
+      alert("Log at least one trade before asking Jarvis for analysis.");
+      return;
+    }
+
+    setAnalysisLoading(true);
+    setAnalysisError("");
+    setAnalysisText("");
+
+    try {
+      // Limit to last 15 trades to keep prompt size reasonable
+      const recent = trades.slice(0, 15);
+
+      const summaryLines = recent.map((t, idx) => {
+        return `${idx + 1}) ${t.date} | ${t.symbol} | ${t.direction} | resultR: ${
+          t.rrResult || "n/a"
+        } | outcome: ${t.outcome} | before: ${
+          t.emotionBefore
+        } | after: ${t.emotionAfter} | notes: ${
+          t.notes ? t.notes.replace(/\s+/g, " ").slice(0, 160) : "none"
+        }`;
+      });
+
+      const content = `
+I am a discretionary trader working on discipline, emotions and consistency.
+
+Here are my most recent trades (max 15, most recent first):
+${summaryLines.join("\n")}
+
+Please:
+- Find emotional and behavioral patterns (overtrading, revenge, fear, FOMO, discipline issues).
+- Comment on risk management quality and R:R.
+- Give 3–5 clear, direct rules I should follow next week to improve.
+- Be honest but supportive, talk to me like a trading mentor who knows I’m still growing.
+`;
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messages: [{ role: "user", content }],
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Request failed with status ${res.status}`);
+      }
+
+      const data = await res.json();
+      const reply =
+        data.reply ||
+        "I couldn't generate feedback this time. Try again in a bit or check your connection.";
+
+      setAnalysisText(reply);
+    } catch (err) {
+      console.error("Analysis error:", err);
+      setAnalysisError(
+        "Jarvis couldn't analyze your trades (API error or connection issue). Try again in a moment."
+      );
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
   return (
     <div className="flex min-h-screen items-center justify-center px-2 py-4 sm:px-4">
       <div className="flex w-full max-w-6xl flex-col gap-4 sm:gap-5">
@@ -149,8 +222,8 @@ export default function JournalPage() {
                 Trading Journal
               </h1>
               <p className="text-xs text-slate-400 sm:text-sm">
-                Log each trade with R, emotions, and outcomes. Jarvis will use this later
-                to understand your patterns.
+                Log each trade with R, emotions, and outcomes. Jarvis will use this to
+                understand your patterns.
               </p>
             </div>
           </div>
@@ -170,11 +243,9 @@ export default function JournalPage() {
 
         {/* Stats + Form */}
         <main className="flex flex-col gap-4 lg:flex-row lg:items-start">
-          {/* Stats card */}
+          {/* Stats + ask button */}
           <section className="w-full space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/80 p-4 shadow-xl shadow-black/40 backdrop-blur sm:p-5 lg:w-72">
-            <h2 className="text-sm font-semibold text-slate-100">
-              Session Stats
-            </h2>
+            <h2 className="text-sm font-semibold text-slate-100">Session Stats</h2>
             <p className="text-xs text-slate-400">
               Quick overview of your journal performance. Focus on consistency, not just R.
             </p>
@@ -205,6 +276,18 @@ export default function JournalPage() {
                 </div>
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={handleAskJarvis}
+              disabled={analysisLoading || !trades.length}
+              className="mt-2 w-full rounded-xl bg-indigo-500 px-3 py-2 text-[0.7rem] font-semibold uppercase tracking-wide text-slate-950 shadow-lg shadow-indigo-500/40 transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-400 disabled:shadow-none"
+            >
+              {analysisLoading ? "Jarvis is analyzing…" : "Ask Jarvis about these trades"}
+            </button>
+            <p className="text-[0.65rem] text-slate-500">
+              Uses your last {Math.min(trades.length || 0, 15)} trade(s) as context.
+            </p>
           </section>
 
           {/* Form + table */}
@@ -214,9 +297,7 @@ export default function JournalPage() {
               onSubmit={handleSubmit}
               className="space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/80 p-4 shadow-xl shadow-black/40 backdrop-blur sm:p-5"
             >
-              <h2 className="text-sm font-semibold text-slate-100">
-                Log a New Trade
-              </h2>
+              <h2 className="text-sm font-semibold text-slate-100">Log a New Trade</h2>
 
               <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                 <div className="space-y-1">
@@ -393,6 +474,31 @@ export default function JournalPage() {
                 </button>
               </div>
             </form>
+
+            {/* Jarvis analysis panel */}
+            {(analysisText || analysisError || analysisLoading) && (
+              <section className="rounded-2xl border border-slate-800/80 bg-slate-950/80 p-4 shadow-xl shadow-black/40 backdrop-blur sm:p-5">
+                <h2 className="mb-1 text-sm font-semibold text-slate-100">
+                  Jarvis feedback on your recent trades
+                </h2>
+                <p className="mb-3 text-[0.7rem] text-slate-500">
+                  This is based on the last {Math.min(trades.length || 0, 15)} trade(s) in
+                  your journal.
+                </p>
+
+                {analysisLoading && (
+                  <p className="text-xs text-slate-400">Analyzing… hold on bro.</p>
+                )}
+                {analysisError && (
+                  <p className="text-xs text-rose-400">{analysisError}</p>
+                )}
+                {analysisText && (
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/80 px-3 py-3 text-xs leading-relaxed text-slate-100 whitespace-pre-wrap">
+                    {analysisText}
+                  </div>
+                )}
+              </section>
+            )}
 
             {/* Trades table */}
             <section className="rounded-2xl border border-slate-800/80 bg-slate-950/80 p-3 shadow-xl shadow-black/40 backdrop-blur sm:p-4">
