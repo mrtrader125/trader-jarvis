@@ -3,7 +3,6 @@
     {
       "path": "/api/reminder-ping",
       "schedule": "0 7 * * *",
-      "timezone": "Asia/Kolkata"
     }
   ]
 }
