@@ -4,27 +4,59 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Simple Jarvis brain for Telegram
-async function askJarvisFromTelegram(text) {
+// Simple in-memory conversation store per Telegram chat
+// NOTE: On serverless this can reset if the instance is recycled.
+// For persistent memory, later we can plug in a real database.
+const conversations = new Map(); // chatId -> [{ role, content }, ...]
+const MAX_MESSAGES = 12; // how many recent turns to keep in context
+
+function getSystemPrompt() {
+  return {
+    role: "system",
+    content:
+      "You are Jarvis, a friendly but honest trading & life companion for a discretionary trader. " +
+      "You know he struggles with discipline, emotions, FOMO, revenge trading and wants consistency & financial freedom. " +
+      "Talk in a casual bro tone (use 'bro' sometimes), short and clear, but give real guidance. " +
+      "He often messages you from his phone via Telegram, so keep answers compact but meaningful.",
+  };
+}
+
+async function askJarvisWithMemory(chatId, userText) {
+  // Get existing history for this chat
+  let history = conversations.get(chatId) || [];
+
+  // Add the new user message
+  history = [...history, { role: "user", content: userText }];
+
+  // Trim to last N messages to avoid huge context
+  if (history.length > MAX_MESSAGES) {
+    history = history.slice(history.length - MAX_MESSAGES);
+  }
+
+  // Build messages for Groq: system + history
+  const messagesForGroq = [getSystemPrompt(), ...history];
+
   const completion = await groq.chat.completions.create({
     model: "llama-3.1-70b-versatile",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are Jarvis, a friendly but honest trading & life companion for a discretionary trader. You know he struggles with discipline, emotions, FOMO, revenge trading and wants consistency & financial freedom. Talk in a casual bro tone, short and clear, but give real guidance.",
-      },
-      {
-        role: "user",
-        content: text,
-      },
-    ],
+    messages: messagesForGroq,
     temperature: 0.7,
   });
 
   const reply =
     completion.choices?.[0]?.message?.content?.trim() ||
     "Bro, my brain glitched for a sec. Try again.";
+
+  // Add assistant reply to history
+  history = [...history, { role: "assistant", content: reply }];
+
+  // Trim again if needed
+  if (history.length > MAX_MESSAGES) {
+    history = history.slice(history.length - MAX_MESSAGES);
+  }
+
+  // Save back to memory
+  conversations.set(chatId, history);
+
   return reply;
 }
 
@@ -58,7 +90,6 @@ export async function POST(req) {
 
     const update = await req.json();
 
-    // Only handle normal text messages for now
     const message = update.message;
     if (!message || !message.text) {
       return new Response("No message", { status: 200 });
@@ -67,24 +98,34 @@ export async function POST(req) {
     const chatId = message.chat.id;
     const text = message.text.trim();
 
-    // Optional: basic /start command
+    // Handle /start
     if (text === "/start") {
       await sendTelegramMessage(
         chatId,
-        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nJust send me a message about trading, emotions or life and I'll reply."
+        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nTalk to me about trading, emotions or life. I'll remember the conversation and guide you."
       );
       return new Response("ok", { status: 200 });
     }
 
-    // Call Jarvis brain (Groq)
-    const reply = await askJarvisFromTelegram(text);
+    // Handle /reset to clear memory
+    if (text === "/reset") {
+      conversations.delete(chatId);
+      await sendTelegramMessage(
+        chatId,
+        "Memory wiped for this chat bro 🧹. We start fresh now."
+      );
+      return new Response("ok", { status: 200 });
+    }
 
-    // Send back to Telegram
+    // Normal message: call Jarvis with memory
+    const reply = await askJarvisWithMemory(chatId, text);
+
     await sendTelegramMessage(chatId, reply);
 
     return new Response("ok", { status: 200 });
   } catch (err) {
     console.error("Telegram webhook error:", err);
-    return new Response("error", { status: 200 }); // always 200 so Telegram doesn't spam retries too hard
+    // Return 200 so Telegram doesn't keep retrying aggressively
+    return new Response("error", { status: 200 });
   }
 }
