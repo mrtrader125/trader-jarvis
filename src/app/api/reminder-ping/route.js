@@ -26,9 +26,7 @@ export async function GET() {
   try {
     // TODO: replace this with your real chat id(s).
     // Get it by sending /id to your bot and reading the reply.
-    const CHAT_IDS = [
-      /* YOUR_CHAT_ID_HERE as a number, e.g. 123456789 */
-    ];
+    const CHAT_IDS = [6495161093];
 
     if (CHAT_IDS.length === 0) {
       console.warn("No chat IDs configured in reminder-ping");
@@ -48,3 +46,4 @@ export async function GET() {
     return new Response("error", { status: 200 });
   }
 }
+
