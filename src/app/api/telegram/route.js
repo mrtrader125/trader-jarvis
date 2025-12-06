@@ -1,9 +1,12 @@
-// This route connects Telegram <-> your existing /api/chat brain.
-// It keeps short conversation memory per Telegram chat and forwards
-// messages to /api/chat, which already talks to Groq.
+// Telegram <-> Jarvis bridge
+// - Text + short-term memory per chat
+// - Voice messages via Deepgram STT
+// - Uses your existing /api/chat as Jarvis brain
 
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
 const MAX_MESSAGES = 12;
+
+// --- Helpers ---
 
 async function sendTelegramMessage(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -29,20 +32,52 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
-// Forward the conversation to /api/chat (your existing Jarvis brain)
+// Transcribe Telegram voice file using Deepgram
+async function transcribeAudioFromUrl(fileUrl) {
+  const dgKey = process.env.DEEPGRAM_API_KEY;
+  if (!dgKey) {
+    console.error("Missing DEEPGRAM_API_KEY");
+    return null;
+  }
+
+  try {
+    const res = await fetch(
+      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${dgKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ url: fileUrl }),
+      }
+    );
+
+    if (!res.ok) {
+      console.error("Deepgram error:", res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    const transcript =
+      data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+    return transcript.trim() || null;
+  } catch (err) {
+    console.error("Deepgram request failed:", err);
+    return null;
+  }
+}
+
+// Call your existing /api/chat Jarvis brain with memory
 async function askJarvisViaChatAPI(chatId, userText, req) {
-  // Load history
   let history = conversations.get(chatId) || [];
 
-  // Add user message
   history = [...history, { role: "user", content: userText }];
 
-  // Trim
   if (history.length > MAX_MESSAGES) {
     history = history.slice(history.length - MAX_MESSAGES);
   }
 
-  // Build base URL from request headers (works on Vercel)
   const host = req.headers.get("host");
   const proto = req.headers.get("x-forwarded-proto") || "https";
   const baseUrl = `${proto}://${host}`;
@@ -64,11 +99,12 @@ async function askJarvisViaChatAPI(chatId, userText, req) {
       data.reply ||
       "Bro, my brain glitched for a sec while talking to the main server. Try again.";
 
-    // Save assistant reply in history
     history = [...history, { role: "assistant", content: reply }];
+
     if (history.length > MAX_MESSAGES) {
       history = history.slice(history.length - MAX_MESSAGES);
     }
+
     conversations.set(chatId, history);
 
     return reply;
@@ -77,6 +113,8 @@ async function askJarvisViaChatAPI(chatId, userText, req) {
     return "Bro, something broke while talking to the main Jarvis brain. Try again in a minute.";
   }
 }
+
+// --- Main handler ---
 
 export async function POST(req) {
   let chatId = null;
@@ -91,24 +129,29 @@ export async function POST(req) {
     const update = await req.json();
     const message = update.message;
 
-    if (!message || !message.text) {
+    if (!message) {
       return new Response("No message", { status: 200 });
     }
 
     chatId = message.chat.id;
-    const text = message.text.trim();
 
-    // /start = intro
-    if (text === "/start") {
+    // /id -> show chat id (useful for reminders later)
+    if (message.text && message.text.trim() === "/id") {
+      await sendTelegramMessage(chatId, `Your chat id is: \`${chatId}\``);
+      return new Response("ok", { status: 200 });
+    }
+
+    // /start
+    if (message.text && message.text.trim() === "/start") {
       await sendTelegramMessage(
         chatId,
-        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nTalk to me about trading, emotions or life. I'll remember the conversation and guide you."
+        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nTalk to me about trading, emotions or life. I'll remember the conversation and guide you.\n\nYou can also send *voice messages* and I'll understand you."
       );
       return new Response("ok", { status: 200 });
     }
 
-    // /reset = wipe memory
-    if (text === "/reset") {
+    // /reset
+    if (message.text && message.text.trim() === "/reset") {
       conversations.delete(chatId);
       await sendTelegramMessage(
         chatId,
@@ -117,7 +160,64 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // Normal text → forward to /api/chat with memory
+    // --- NEW: handle voice message ---
+    if (message.voice) {
+      const fileId = message.voice.file_id;
+
+      try {
+        // 1) Get file path from Telegram
+        const getFileUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`;
+        const fileRes = await fetch(getFileUrl);
+        const fileData = await fileRes.json();
+
+        if (!fileData.ok) {
+          console.error("getFile error:", fileData);
+          await sendTelegramMessage(
+            chatId,
+            "Bro, I couldn't access that voice message. Try again or type it out."
+          );
+          return new Response("ok", { status: 200 });
+        }
+
+        const filePath = fileData.result.file_path;
+        const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+
+        // 2) Transcribe via Deepgram
+        const transcript = await transcribeAudioFromUrl(fileUrl);
+
+        if (!transcript) {
+          await sendTelegramMessage(
+            chatId,
+            "Bro, I couldn't understand that voice clearly. Can you send it again or type it?"
+          );
+          return new Response("ok", { status: 200 });
+        }
+
+        // 3) Send transcript through Jarvis brain
+        const reply = await askJarvisViaChatAPI(
+          chatId,
+          `(voice message) ${transcript}`,
+          req
+        );
+
+        await sendTelegramMessage(chatId, reply);
+        return new Response("ok", { status: 200 });
+      } catch (err) {
+        console.error("Error handling voice message:", err);
+        await sendTelegramMessage(
+          chatId,
+          "Bro, something broke while processing that voice note. Try again or type it out."
+        );
+        return new Response("ok", { status: 200 });
+      }
+    }
+
+    // --- Normal text message ---
+    const text = (message.text || "").trim();
+    if (!text) {
+      return new Response("No text", { status: 200 });
+    }
+
     const reply = await askJarvisViaChatAPI(chatId, text, req);
     await sendTelegramMessage(chatId, reply);
 
