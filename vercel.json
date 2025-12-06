@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/reminder-ping",
+      "schedule": "0 7 * * *"
+    }
+  ]
+}
