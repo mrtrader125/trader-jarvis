@@ -7,26 +7,145 @@ export default function ReadinessPage() {
   const [latestCheckIn, setLatestCheckIn] = useState(null);
   const [recentTrades, setRecentTrades] = useState([]);
   const [result, setResult] = useState(null);
+  const [storageDebug, setStorageDebug] = useState({
+    keys: [],
+    checkinKey: null,
+    tradesKey: null,
+  });
 
   useEffect(() => {
     try {
-      const checkinsRaw = localStorage.getItem("jarvis_checkins");
-      if (checkinsRaw) {
-        const arr = JSON.parse(checkinsRaw);
-        if (Array.isArray(arr) && arr.length > 0) {
-          setLatestCheckIn(arr[arr.length - 1]); // last one
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        keys.push(key);
+      }
+
+      let foundCheckins = null;
+      let foundCheckinKey = null;
+      let foundTrades = null;
+      let foundTradesKey = null;
+
+      // 1) Prefer specific known keys if they exist
+      const knownCheckinKeys = [
+        "jarvis_checkins",
+        "jarvis_daily_checkins",
+        "trader_jarvis_checkins",
+      ];
+      const knownTradeKeys = [
+        "jarvis_trades",
+        "jarvis_trading_journal",
+        "trader_jarvis_trades",
+      ];
+
+      for (const k of knownCheckinKeys) {
+        const raw = localStorage.getItem(k);
+        if (raw) {
+          try {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr) && arr.length > 0) {
+              foundCheckins = arr;
+              foundCheckinKey = k;
+              break;
+            }
+          } catch (e) {
+            // ignore
+          }
         }
       }
 
-      const tradesRaw = localStorage.getItem("jarvis_trades");
-      if (tradesRaw) {
-        const arr = JSON.parse(tradesRaw);
-        if (Array.isArray(arr)) {
-          setRecentTrades(arr);
+      for (const k of knownTradeKeys) {
+        const raw = localStorage.getItem(k);
+        if (raw) {
+          try {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr) && arr.length > 0) {
+              foundTrades = arr;
+              foundTradesKey = k;
+              break;
+            }
+          } catch (e) {
+            // ignore
+          }
         }
       }
+
+      // 2) If still not found, auto-detect by shape
+      if (!foundCheckins) {
+        for (const key of keys) {
+          const raw = localStorage.getItem(key);
+          if (!raw) continue;
+          try {
+            const value = JSON.parse(raw);
+            if (Array.isArray(value) && value.length > 0) {
+              // looks like checkins?
+              const looksLikeCheckin = value.some((item) => {
+                if (!item || typeof item !== "object") return false;
+                return (
+                  "sleep" in item ||
+                  "sleepHours" in item ||
+                  "sleepQuality" in item ||
+                  "mood" in item ||
+                  "stress" in item
+                );
+              });
+              if (looksLikeCheckin) {
+                foundCheckins = value;
+                foundCheckinKey = key;
+                break;
+              }
+            }
+          } catch (_) {
+            // ignore parse errors
+          }
+        }
+      }
+
+      if (!foundTrades) {
+        for (const key of keys) {
+          const raw = localStorage.getItem(key);
+          if (!raw) continue;
+          try {
+            const value = JSON.parse(raw);
+            if (Array.isArray(value) && value.length > 0) {
+              // looks like trades?
+              const looksLikeTrades = value.some((item) => {
+                if (!item || typeof item !== "object") return false;
+                return (
+                  "symbol" in item ||
+                  "pair" in item ||
+                  "resultR" in item ||
+                  "plannedRR" in item ||
+                  "outcome" in item
+                );
+              });
+              if (looksLikeTrades) {
+                foundTrades = value;
+                foundTradesKey = key;
+                break;
+              }
+            }
+          } catch (_) {
+            // ignore
+          }
+        }
+      }
+
+      // 3) Update state
+      if (foundCheckins && foundCheckins.length > 0) {
+        setLatestCheckIn(foundCheckins[foundCheckins.length - 1]);
+      }
+      if (foundTrades && foundTrades.length > 0) {
+        setRecentTrades(foundTrades);
+      }
+
+      setStorageDebug({
+        keys,
+        checkinKey: foundCheckinKey,
+        tradesKey: foundTradesKey,
+      });
     } catch (e) {
-      console.error("Error reading readiness data from localStorage:", e);
+      console.error("Error scanning localStorage:", e);
     }
   }, []);
 
@@ -34,9 +153,7 @@ export default function ReadinessPage() {
     if (latestCheckIn) {
       setResult(computeReadinessScore(latestCheckIn, recentTrades));
     } else {
-      setResult(
-        computeReadinessScore(null, recentTrades) // will return "No data"
-      );
+      setResult(computeReadinessScore(null, recentTrades));
     }
   }, [latestCheckIn, recentTrades]);
 
@@ -44,7 +161,7 @@ export default function ReadinessPage() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center px-4 py-10">
-      <div className="w-full max-w-4xl space-y-6">
+      <div className="w-full max-w-5xl space-y-6">
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">
@@ -62,7 +179,7 @@ export default function ReadinessPage() {
           </a>
         </header>
 
-        <main className="grid gap-6 md:grid-cols-[2fr,1.5fr]">
+        <main className="grid gap-6 md:grid-cols-[2fr,1.4fr]">
           {/* Score card */}
           <section className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 shadow-lg shadow-black/40">
             <div className="flex items-center justify-between mb-4">
@@ -121,12 +238,12 @@ export default function ReadinessPage() {
               </>
             ) : (
               <p className="text-sm text-slate-400">
-                No data yet. Log a daily check-in and a few journal trades first.
+                No data yet. Log a daily check-in and some journal trades first.
               </p>
             )}
           </section>
 
-          {/* Raw data preview */}
+          {/* Data + debug */}
           <section className="space-y-4">
             <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
               <h2 className="text-sm font-semibold mb-2">Latest Check-In</h2>
@@ -136,7 +253,7 @@ export default function ReadinessPage() {
                 </pre>
               ) : (
                 <p className="text-xs text-slate-500">
-                  No check-ins found yet. Use the Daily Check-In page first.
+                  No check-ins found yet in localStorage.
                 </p>
               )}
             </div>
@@ -151,9 +268,34 @@ export default function ReadinessPage() {
                 </pre>
               ) : (
                 <p className="text-xs text-slate-500">
-                  No trades found yet. Log some trades in your Trading Journal.
+                  No trades found yet in localStorage.
                 </p>
               )}
+            </div>
+
+            {/* Debug panel so we can see what's going on */}
+            <div className="bg-slate-900/40 border border-dashed border-slate-700 rounded-2xl p-4">
+              <h2 className="text-xs font-semibold mb-2 text-slate-400">
+                Storage Debug (for you & Jarvis dev)
+              </h2>
+              <p className="text-[11px] text-slate-500 mb-1">
+                LocalStorage keys on this browser:
+              </p>
+              <pre className="text-[11px] text-slate-400 whitespace-pre-wrap break-words bg-slate-950/60 rounded-xl p-3 max-h-40 overflow-y-auto mb-2">
+{JSON.stringify(storageDebug.keys, null, 2)}
+              </pre>
+              <p className="text-[11px] text-slate-500">
+                Detected check-in key:{" "}
+                <span className="text-slate-200">
+                  {storageDebug.checkinKey || "none"}
+                </span>
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Detected trades key:{" "}
+                <span className="text-slate-200">
+                  {storageDebug.tradesKey || "none"}
+                </span>
+              </p>
             </div>
           </section>
         </main>
