@@ -1,67 +1,9 @@
-import Groq from "groq-sdk";
+// This route connects Telegram <-> your existing /api/chat brain.
+// It keeps short conversation memory per Telegram chat and forwards
+// messages to /api/chat, which already talks to Groq.
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
-// In-memory conversation per Telegram chat
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
 const MAX_MESSAGES = 12;
-
-function getSystemPrompt() {
-  return {
-    role: "system",
-    content:
-      "You are Jarvis, a friendly but honest trading & life companion for a discretionary trader. " +
-      "You know he struggles with discipline, emotions, FOMO, revenge trading and wants consistency & financial freedom. " +
-      "Talk in a casual bro tone (use 'bro' sometimes), short and clear, but give real guidance. " +
-      "He often messages you from his phone via Telegram, so keep answers compact but meaningful.",
-  };
-}
-
-async function askJarvisWithMemory(chatId, userText) {
-  // Get existing history
-  let history = conversations.get(chatId) || [];
-
-  // Add the new user message
-  history = [...history, { role: "user", content: userText }];
-
-  // Trim to last N messages
-  if (history.length > MAX_MESSAGES) {
-    history = history.slice(history.length - MAX_MESSAGES);
-  }
-
-  const messagesForGroq = [getSystemPrompt(), ...history];
-
-  try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.1-70b-versatile",
-      messages: messagesForGroq,
-      temperature: 0.7,
-    });
-
-    const reply =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "Bro, my brain glitched for a sec. Try again.";
-
-    // Save assistant reply
-    history = [...history, { role: "assistant", content: reply }];
-
-    if (history.length > MAX_MESSAGES) {
-      history = history.slice(history.length - MAX_MESSAGES);
-    }
-
-    conversations.set(chatId, history);
-
-    return reply;
-  } catch (err) {
-    console.error("Groq error in Telegram route:", err);
-    return (
-      "Bro, my brain hit an error talking to the server. " +
-      "Check your internet or try again in a bit."
-    );
-  }
-}
 
 async function sendTelegramMessage(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -87,6 +29,55 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
+// Forward the conversation to /api/chat (your existing Jarvis brain)
+async function askJarvisViaChatAPI(chatId, userText, req) {
+  // Load history
+  let history = conversations.get(chatId) || [];
+
+  // Add user message
+  history = [...history, { role: "user", content: userText }];
+
+  // Trim
+  if (history.length > MAX_MESSAGES) {
+    history = history.slice(history.length - MAX_MESSAGES);
+  }
+
+  // Build base URL from request headers (works on Vercel)
+  const host = req.headers.get("host");
+  const proto = req.headers.get("x-forwarded-proto") || "https";
+  const baseUrl = `${proto}://${host}`;
+
+  try {
+    const res = await fetch(`${baseUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: history }),
+    });
+
+    if (!res.ok) {
+      console.error("Error calling /api/chat from Telegram:", res.status);
+      return "Bro, my brain had an issue reaching the main server. Try again in a bit.";
+    }
+
+    const data = await res.json();
+    const reply =
+      data.reply ||
+      "Bro, my brain glitched for a sec while talking to the main server. Try again.";
+
+    // Save assistant reply in history
+    history = [...history, { role: "assistant", content: reply }];
+    if (history.length > MAX_MESSAGES) {
+      history = history.slice(history.length - MAX_MESSAGES);
+    }
+    conversations.set(chatId, history);
+
+    return reply;
+  } catch (err) {
+    console.error("Error in askJarvisViaChatAPI:", err);
+    return "Bro, something broke while talking to the main Jarvis brain. Try again in a minute.";
+  }
+}
+
 export async function POST(req) {
   let chatId = null;
 
@@ -107,7 +98,7 @@ export async function POST(req) {
     chatId = message.chat.id;
     const text = message.text.trim();
 
-    // /start = intro (no memory)
+    // /start = intro
     if (text === "/start") {
       await sendTelegramMessage(
         chatId,
@@ -126,24 +117,19 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // Normal message → Jarvis with memory
-    const reply = await askJarvisWithMemory(chatId, text);
-
+    // Normal text → forward to /api/chat with memory
+    const reply = await askJarvisViaChatAPI(chatId, text, req);
     await sendTelegramMessage(chatId, reply);
 
     return new Response("ok", { status: 200 });
   } catch (err) {
     console.error("Telegram webhook error:", err);
-
-    // Try to at least tell the user something
     if (chatId) {
       await sendTelegramMessage(
         chatId,
         "Bro, something broke on the server side. Try again in a minute."
       );
     }
-
-    // Always 200 so Telegram doesn't spam retries
     return new Response("error", { status: 200 });
   }
 }
