@@ -97,6 +97,14 @@ export default function Home() {
               V1 · Chat only · More coming soon
             </span>
 
+            {/* New: Daily check-in link */}
+            <Link
+              href="/checkin"
+              className="rounded-full bg-amber-500/15 px-3 py-1 font-medium text-amber-200 ring-1 ring-amber-500/60 hover:bg-amber-500/25 transition"
+            >
+              Daily Check-in
+            </Link>
+
             {/* Journal link */}
             <Link
               href="/journal"
