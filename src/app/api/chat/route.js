@@ -3,32 +3,33 @@
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
 
-// ------------------------
-// Groq client
-// ------------------------
+// --- Groq client ------------------------------------------------------------
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Simple flag so we can see in GET if Supabase is wired later
-const supabaseConfigured =
-  !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Use a modern Groq model (old ones are decommissioned)
+const DEFAULT_MODEL = "llama-3.3-70b-versatile";
 
-// ------------------------
-// GET  /api/chat  (health check)
-// ------------------------
+// Small helper so GET can tell us if Supabase is wired later
+function isSupabaseConfigured() {
+  return (
+    !!process.env.NEXT_PUBLIC_SUPABASE_URL &&
+    !!process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+}
+
+// ✅ Health check (GET /api/chat)
 export async function GET() {
   return NextResponse.json({
     ok: true,
     message: "Jarvis brain online",
     hasKey: !!process.env.GROQ_API_KEY,
-    supabaseConfigured,
+    supabaseConfigured: isSupabaseConfigured(),
   });
 }
 
-// ------------------------
-// POST /api/chat  (main Jarvis brain)
-// ------------------------
+// 🤖 Main Jarvis brain (POST /api/chat)
 export async function POST(req) {
   try {
     // 1) Hard guard: no key
@@ -39,7 +40,7 @@ export async function POST(req) {
           ok: false,
           error: "NO_API_KEY",
           message:
-            "Bro, my brain is misconfigured on this machine. GROQ_API_KEY is missing. Check .env.local.",
+            "Bro, my brain is misconfigured locally. GROQ_API_KEY is missing. Check .env.local.",
         },
         { status: 500 }
       );
@@ -48,11 +49,8 @@ export async function POST(req) {
     // 2) Parse body safely
     const body = await req.json().catch(() => ({}));
 
-    // We support multiple shapes:
-    // - { text: "hi" }
-    // - { message: "hi" }
-    // - { input: "hi" }
-    // - { messages: [{ role, content }, ...] }
+    // support different shapes:
+    // { text }, { message }, { input }, { messages:[...] }
     let userText =
       body.text ||
       body.message ||
@@ -69,16 +67,12 @@ export async function POST(req) {
 
     if (!userText) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "NO_INPUT",
-          message: "No message provided.",
-        },
+        { ok: false, error: "NO_INPUT", message: "No message provided" },
         { status: 400 }
       );
     }
 
-    // 3) System prompt
+    // 3) Build prompt
     const systemPrompt = `
 You are Jarvis, a calm, supportive trading & life companion for one specific trader.
 
@@ -90,9 +84,8 @@ Style:
 Context:
 - He's a discretionary trader working on consistency and avoiding FOMO / revenge.
 - When he's emotional, slow him down and get him back to his rules.
-`;
+`.trim();
 
-    // 4) Build messages for Groq
     const groqMessages = [
       { role: "system", content: systemPrompt },
       ...history.map((m) => ({
@@ -102,10 +95,9 @@ Context:
       { role: "user", content: String(userText) },
     ];
 
-    // 5) Call Groq with a CURRENT model
+    // 4) Call Groq with new model
     const completion = await groq.chat.completions.create({
-      // 🔁 IMPORTANT: this is a supported model, not the old deprecated one
-      model: "llama3-70b-8192",
+      model: process.env.GROQ_MODEL || DEFAULT_MODEL,
       messages: groqMessages,
       temperature: 0.7,
       max_tokens: 600,
@@ -114,8 +106,6 @@ Context:
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "Bro, I tried to reply but something glitched. Say that again?";
-
-    // (Later we can log to Supabase here; for now we keep it simple.)
 
     return NextResponse.json({ ok: true, reply });
   } catch (err) {
@@ -132,7 +122,7 @@ Context:
         error: "JARVIS_BRAIN_ERROR",
         message:
           "Bro, my brain hit an error talking to the main server. Try again in a bit.",
-        debug: message, // shows real Groq error in Network tab
+        debug: message,
       },
       { status: 500 }
     );
