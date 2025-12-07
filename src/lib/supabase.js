@@ -18,13 +18,17 @@ export const supabase = hasSupabase
   : null;
 
 // ---------------------------------------------------------------------------
-// Helpers: memory table (jarvis_memory)
-// columns: id (uuid, default), user_id text, channel text, type text,
-//          content text, importance int2, created_at timestamptz default now()
+// Tables
 // ---------------------------------------------------------------------------
 
 const MEMORY_TABLE = "jarvis_memory";
 const PROFILE_TABLE = "jarvis_profile";
+
+// ---------------------------------------------------------------------------
+// Helpers: memory table (jarvis_memory)
+// columns: id (uuid, default), user_id text, channel text, type text,
+//          content text, importance int2, created_at timestamptz default now()
+// ---------------------------------------------------------------------------
 
 export async function logMemory({
   userId,
@@ -78,6 +82,87 @@ export async function getRecentMemories({
     console.error("getRecentMemories unexpected error:", err);
     return [];
   }
+}
+
+/**
+ * getMemoriesSince
+ * Used by the daily journal API to pull memories from a given timestamp.
+ *
+ * options:
+ * - userId (required)
+ * - since  (required) Date | string (ISO)
+ * - minImportance (default 1)
+ * - type        (optional filter, e.g. "chat" / "journal")
+ * - channel     (optional filter, e.g. "web" / "telegram")
+ */
+export async function getMemoriesSince({
+  userId,
+  since,
+  minImportance = 1,
+  type,
+  channel,
+}) {
+  if (!supabase || !hasSupabase || !userId || !since) return [];
+
+  try {
+    let query = supabase
+      .from(MEMORY_TABLE)
+      .select("*")
+      .eq("user_id", userId)
+      .gte("created_at", since)
+      .gte("importance", minImportance)
+      .order("created_at", { ascending: true });
+
+    if (type) {
+      query = query.eq("type", type);
+    }
+
+    if (channel) {
+      query = query.eq("channel", channel);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("getMemoriesSince supabase error:", error);
+      return [];
+    }
+
+    return data || [];
+  } catch (err) {
+    console.error("getMemoriesSince unexpected error:", err);
+    return [];
+  }
+}
+
+/**
+ * logJournalEntry
+ * Used by the daily journal API. Under the hood this just logs into
+ * jarvis_memory with type = "journal" so we don't need a separate table.
+ *
+ * options:
+ * - userId (required)
+ * - channel (default "web" / "telegram" etc.)
+ * - content (required)  -> the final journal text / summary
+ * - importance (default 1)
+ */
+export async function logJournalEntry({
+  userId,
+  channel = "web",
+  content,
+  importance = 1,
+}) {
+  if (!supabase || !hasSupabase) return;
+  if (!userId || !content) return;
+
+  // Re-use logMemory but mark these as "journal"
+  return logMemory({
+    userId,
+    channel,
+    type: "journal",
+    content,
+    importance,
+  });
 }
 
 // ---------------------------------------------------------------------------
