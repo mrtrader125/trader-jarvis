@@ -1,6 +1,5 @@
 // src/app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
 import { getNowInfo } from "@/lib/time";
 import { groqClient } from "@/lib/groq";
 
@@ -16,34 +15,11 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const messages: ChatMessage[] = body?.messages ?? [];
 
-    // ---- 1) Setup Supabase (single-user mode) ----
-    const supabase = createClient();
-    const userId = "single-user";
-
-    // ---- 2) Try to load Jarvis profile (but don't crash if missing) ----
-    let profile: any = null;
-    try {
-      const { data, error } = await supabase
-        .from("jarvis_profile")
-        .select("*")
-        .eq("user_id", userId)
-        .single();
-
-      if (error) {
-        console.error("Error loading jarvis_profile:", error.message);
-      } else {
-        profile = data;
-      }
-    } catch (err) {
-      console.error("Exception while loading jarvis_profile:", err);
-    }
-
-    const timezone: string = profile?.timezone || "Asia/Kolkata";
-
-    // ---- 3) Current time info for Jarvis ----
+    // ---- 1) Timezone: for now, hard-code to your local (we'll pull from DB later) ----
+    const timezone = "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
-    // ---- 4) Attach timestamps to each message ----
+    // ---- 2) Attach timestamps to each message ----
     const messagesWithTime = messages.map((m) => {
       const sentAt =
         m.createdAt ||
@@ -56,27 +32,16 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    // ---- 5) System prompt (Jarvis personality + time awareness) ----
+    // ---- 3) System prompt (Jarvis personality + time awareness) ----
     const systemPrompt = `
-You are Jarvis, a long-term trading and life companion for ONE user in SINGLE-USER mode.
-The user id is "single-user". There is no authentication or multi-user context.
+You are Jarvis, a long-term trading and life companion for ONE user.
 
 Current real-world time:
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
 
-User routine (from jarvis_profile, if available):
-- Typical wake time: ${profile?.typical_wake_time ?? "unknown"}
-- Typical sleep time: ${profile?.typical_sleep_time ?? "unknown"}
-- Trading session: ${profile?.trading_session_start ?? "unknown"} - ${
-      profile?.trading_session_end ?? "unknown"
-    }
-
-Personality:
-- Strictness level: ${profile?.strictness_level ?? 7}/10
-- Empathy level: ${profile?.empathy_level ?? 7}/10
-- Humor level: ${profile?.humor_level ?? 5}/10
+There is no authentication or multi-user context. Treat this as a single-user system.
 
 Rules:
 - Always use the user's local time (timezone) when talking about "now", morning, night, etc.
@@ -90,9 +55,9 @@ Rules:
       ...messagesWithTime,
     ];
 
-    // ---- 6) Call Groq LLM ----
+    // ---- 4) Call Groq LLM ----
     const completion = await groqClient.chat.completions.create({
-      model: "mixtral-8x7b-32768", // change if you're using another model
+      model: "mixtral-8x7b-32768", // change to your actual model if different
       messages: finalMessages,
       stream: false,
     });
@@ -108,13 +73,12 @@ Rules:
             .join("\n")
         : "Sorry, I couldn't generate a response.";
 
-    // ---- 7) Return JSON to the frontend ----
+    // ---- 5) Return JSON to the frontend ----
     return NextResponse.json(
       {
         reply: replyContent,
         raw: replyMessage,
         now: nowInfo,
-        profileUsed: !!profile,
       },
       { status: 200 }
     );
@@ -123,12 +87,13 @@ Rules:
     const message =
       error instanceof Error ? error.message : String(error);
 
+    // Important: still return 200 so the frontend can show the error as a message
     return NextResponse.json(
       {
-        error: "Jarvis brain API crashed.",
-        details: message,
+        reply: `Jarvis brain had an internal error: ${message}`,
+        now: null,
       },
-      { status: 500 }
+      { status: 200 }
     );
   }
 }
