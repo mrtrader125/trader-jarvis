@@ -10,7 +10,6 @@ function computeStatusFromCheckin(checkin) {
 
   const sleepHours = Number(checkin.sleepHours || 0);
   const { sleepQuality, mood, stress, energy, focus, urgeToTrade } = checkin;
-
   // --- Hard "no trade" signals ---
   const veryTired = sleepHours > 0 && sleepHours < 4;
   const awfulSleep = sleepQuality === "Very bad";
