@@ -2,28 +2,36 @@
 
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
-import { logJarvisConversation } from "../../../lib/supabase-server";
 
-// Create Groq client once (server-side)
+// ------------------------
+// Groq client
+// ------------------------
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// ✅ Health check (GET /api/chat)
+// Simple flag so we can see in GET if Supabase is wired later
+const supabaseConfigured =
+  !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// ------------------------
+// GET  /api/chat  (health check)
+// ------------------------
 export async function GET() {
   return NextResponse.json({
     ok: true,
     message: "Jarvis brain online",
     hasKey: !!process.env.GROQ_API_KEY,
-    supabaseConfigured:
-      !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    supabaseConfigured,
   });
 }
 
-// 🤖 Main Jarvis brain (POST /api/chat)
+// ------------------------
+// POST /api/chat  (main Jarvis brain)
+// ------------------------
 export async function POST(req) {
   try {
-    // 1) Hard guard: no Groq key
+    // 1) Hard guard: no key
     if (!process.env.GROQ_API_KEY) {
       console.error("GROQ_API_KEY missing in POST /api/chat");
       return NextResponse.json(
@@ -31,7 +39,7 @@ export async function POST(req) {
           ok: false,
           error: "NO_API_KEY",
           message:
-            "Bro, my brain is misconfigured on this server. GROQ_API_KEY is missing. Ask the dev to fix env.",
+            "Bro, my brain is misconfigured on this machine. GROQ_API_KEY is missing. Check .env.local.",
         },
         { status: 500 }
       );
@@ -40,18 +48,11 @@ export async function POST(req) {
     // 2) Parse body safely
     const body = await req.json().catch(() => ({}));
 
-    // Shape support:
+    // We support multiple shapes:
     // - { text: "hi" }
     // - { message: "hi" }
     // - { input: "hi" }
     // - { messages: [{ role, content }, ...] }
-    // Optional extra:
-    // - { source: "web" | "telegram" | ... }
-    // - { chatId: "some-id" }
-    const source = body.source || "web";
-    const chatId = body.chatId || "web-default";
-    const userId = body.userId || null;
-
     let userText =
       body.text ||
       body.message ||
@@ -68,12 +69,16 @@ export async function POST(req) {
 
     if (!userText) {
       return NextResponse.json(
-        { ok: false, error: "NO_INPUT", message: "No message provided" },
+        {
+          ok: false,
+          error: "NO_INPUT",
+          message: "No message provided.",
+        },
         { status: 400 }
       );
     }
 
-    // 3) Build system prompt
+    // 3) System prompt
     const systemPrompt = `
 You are Jarvis, a calm, supportive trading & life companion for one specific trader.
 
@@ -87,7 +92,7 @@ Context:
 - When he's emotional, slow him down and get him back to his rules.
 `;
 
-    // 4) Build Groq messages (simple history support)
+    // 4) Build messages for Groq
     const groqMessages = [
       { role: "system", content: systemPrompt },
       ...history.map((m) => ({
@@ -97,10 +102,10 @@ Context:
       { role: "user", content: String(userText) },
     ];
 
-    // 5) Call Groq (using supported model)
+    // 5) Call Groq with a CURRENT model
     const completion = await groq.chat.completions.create({
-      // IMPORTANT: this model currently works
-      model: "llama-3.1-70b-specdec",
+      // 🔁 IMPORTANT: this is a supported model, not the old deprecated one
+      model: "llama3-70b-8192",
       messages: groqMessages,
       temperature: 0.7,
       max_tokens: 600,
@@ -110,23 +115,8 @@ Context:
       completion.choices?.[0]?.message?.content?.trim() ||
       "Bro, I tried to reply but something glitched. Say that again?";
 
-    // 6) Fire-and-forget logging to Supabase (don't break Jarvis if DB fails)
-    logJarvisConversation({
-      source,
-      chatId,
-      userId,
-      userMessage: userText,
-      assistantReply: reply,
-      meta: {
-        route: "/api/chat",
-        model: "llama-3.1-70b-specdec",
-        source,
-      },
-    }).catch((err) =>
-      console.error("[Jarvis] Supabase log promise error:", err)
-    );
+    // (Later we can log to Supabase here; for now we keep it simple.)
 
-    // 7) Normal response back to client
     return NextResponse.json({ ok: true, reply });
   } catch (err) {
     console.error("Jarvis /api/chat error:", err);
@@ -142,7 +132,7 @@ Context:
         error: "JARVIS_BRAIN_ERROR",
         message:
           "Bro, my brain hit an error talking to the main server. Try again in a bit.",
-        debug: message,
+        debug: message, // shows real Groq error in Network tab
       },
       { status: 500 }
     );
