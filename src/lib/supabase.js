@@ -25,6 +25,7 @@ const PROFILE_TABLE = "jarvis_profile";
 const JOURNAL_TABLE = "jarvis_journal";
 const RULES_TABLE = "jarvis_rules";
 const PLANS_TABLE = "jarvis_plans";
+const SYSTEMS_TABLE = "jarvis_systems"; // 🔥 NEW: trading / news systems
 
 // ---------------------------------------------------------------------------
 // Raw memory log (jarvis_memory)
@@ -154,7 +155,7 @@ export async function logJournalEntry({
 }
 
 // ---------------------------------------------------------------------------
-// Long-term profile (jarvis_profile)
+/** Long-term profile (jarvis_profile) */
 // ---------------------------------------------------------------------------
 export async function getUserProfileSummary(userId) {
   if (!supabase || !hasSupabase) return null;
@@ -302,5 +303,112 @@ export async function listBusinessPlans({ userId, limit = 50 } = {}) {
   } catch (err) {
     console.error("listBusinessPlans unexpected error:", err);
     return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Trading / systems brain (jarvis_systems)
+// ---------------------------------------------------------------------------
+
+/**
+ * Save a new system (e.g. trading system v1, v2, ...).
+ * - Archives previous active system for this user & type.
+ * - Auto-increments version number.
+ */
+export async function saveSystem({
+  userId,
+  type = "trading_system", // could also be 'news_playbook' later
+  name = "Trading System",
+  content,
+  status = "active",
+}) {
+  if (!supabase || !hasSupabase)
+    return { ok: false, reason: "NO_CLIENT" };
+  if (!content || !content.trim()) {
+    return { ok: false, reason: "EMPTY_CONTENT" };
+  }
+
+  try {
+    // 1) Archive current active system (if any)
+    const { error: archiveError } = await supabase
+      .from(SYSTEMS_TABLE)
+      .update({ status: "archived" })
+      .eq("user_id", userId)
+      .eq("type", type)
+      .eq("status", "active");
+
+    if (archiveError) {
+      console.error("saveSystem archive error:", archiveError);
+      // not fatal
+    }
+
+    // 2) Find last version
+    let nextVersion = 1;
+    const { data: last, error: lastErr } = await supabase
+      .from(SYSTEMS_TABLE)
+      .select("version")
+      .eq("user_id", userId)
+      .eq("type", type)
+      .order("version", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!lastErr && last?.version) {
+      nextVersion = (last.version || 0) + 1;
+    }
+
+    // 3) Insert new system
+    const { error: insertError } = await supabase
+      .from(SYSTEMS_TABLE)
+      .insert({
+        user_id: userId,
+        type,
+        name,
+        version: nextVersion,
+        status,
+        content,
+      });
+
+    if (insertError) {
+      console.error("saveSystem insert error:", insertError);
+      return { ok: false, reason: "INSERT_ERROR", error: insertError };
+    }
+
+    return { ok: true, version: nextVersion };
+  } catch (err) {
+    console.error("saveSystem unexpected error:", err);
+    return { ok: false, reason: "UNEXPECTED", error: err };
+  }
+}
+
+/**
+ * Get active system for user & type (e.g. trading_system).
+ */
+export async function getActiveSystem({
+  userId,
+  type = "trading_system",
+}) {
+  if (!supabase || !hasSupabase) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from(SYSTEMS_TABLE)
+      .select("*")
+      .eq("user_id", userId)
+      .eq("type", type)
+      .eq("status", "active")
+      .order("version", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("getActiveSystem error:", error);
+      return null;
+    }
+
+    return data || null;
+  } catch (err) {
+    console.error("getActiveSystem unexpected error:", err);
+    return null;
   }
 }
