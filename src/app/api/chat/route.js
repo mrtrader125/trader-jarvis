@@ -18,7 +18,7 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-const MODEL = process.env.GROQ_MODEL || "mixtral-8x7b-32k";
+const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 
 function toLowerSafe(str) {
   return String(str || "").toLowerCase();
