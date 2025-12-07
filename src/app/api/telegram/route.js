@@ -1,15 +1,18 @@
 // src/app/api/telegram/route.js
 // Telegram <-> Jarvis bridge
 // - Text + short-term memory per chat
-// - Voice messages via Deepgram STT (binary audio)
+// - Voice input via Deepgram STT (binary audio)
+// - Voice replies via Deepgram TTS
 // - Uses your existing /api/chat as Jarvis brain
+
+import { textToSpeechBuffer } from "@/lib/jarvis-tts";
 
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
 const MAX_MESSAGES = 12;
 
 // --- Helpers ---
 
-async function sendTelegramMessage(chatId, text) {
+async function sendTelegramText(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error("TELEGRAM_BOT_TOKEN is missing");
@@ -33,11 +36,50 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
+// Turn Jarvis reply text into a Telegram voice note
+async function sendTelegramVoice(chatId, text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("TELEGRAM_BOT_TOKEN is missing for voice");
+    return;
+  }
+
+  const audioBuffer = await textToSpeechBuffer(text);
+  if (!audioBuffer) return;
+
+  const url = `https://api.telegram.org/bot${token}/sendVoice`;
+
+  try {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+
+    // Deepgram returns an ArrayBuffer; Blob accepts that directly
+    const blob = new Blob([audioBuffer], { type: "audio/ogg" });
+    form.append("voice", blob, "jarvis.ogg");
+
+    await fetch(url, {
+      method: "POST",
+      body: form,
+    });
+  } catch (err) {
+    console.error("Failed to send Telegram voice:", err);
+  }
+}
+
+// Combine: send text + voice reply
+async function sendJarvisReply(chatId, text) {
+  await sendTelegramText(chatId, text);
+  // Fire & forget voice; even if TTS fails, user still sees text
+  sendTelegramVoice(chatId, text).catch((e) =>
+    console.error("sendJarvisReply voice error:", e)
+  );
+}
+
 // Transcribe Telegram voice file using Deepgram (sending audio bytes)
 async function transcribeAudioBinary(audioArrayBuffer) {
   const dgKey = process.env.DEEPGRAM_API_KEY;
   if (!dgKey) {
-    console.error("Missing DEEPGRAM_API_KEY");
+    console.error("Missing DEEPGRAM_API_KEY for STT");
     return "__NO_DEEPGRAM_KEY__";
   }
 
@@ -55,7 +97,7 @@ async function transcribeAudioBinary(audioArrayBuffer) {
     );
 
     if (!dgRes.ok) {
-      console.error("Deepgram error:", dgRes.status, await dgRes.text());
+      console.error("Deepgram STT error:", dgRes.status, await dgRes.text());
       return null;
     }
 
@@ -64,7 +106,7 @@ async function transcribeAudioBinary(audioArrayBuffer) {
       data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
     return transcript.trim() || null;
   } catch (err) {
-    console.error("Deepgram request failed:", err);
+    console.error("Deepgram STT request failed:", err);
     return null;
   }
 }
@@ -141,15 +183,15 @@ export async function POST(req) {
 
     // /id -> show chat id (for reminders etc.)
     if (message.text && message.text.trim() === "/id") {
-      await sendTelegramMessage(chatId, `Your chat id is: \`${chatId}\``);
+      await sendTelegramText(chatId, `Your chat id is: \`${chatId}\``);
       return new Response("ok", { status: 200 });
     }
 
     // /start
     if (message.text && message.text.trim() === "/start") {
-      await sendTelegramMessage(
+      await sendTelegramText(
         chatId,
-        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nTalk to me about trading, emotions or life. I'll remember the conversation and guide you.\n\nYou can also send *voice messages* and I'll understand you."
+        "Yo bro, I'm Jarvis in Telegram now 🚀\n\nTalk to me about trading, emotions or life. I'll remember the conversation and guide you.\n\nSend *text or voice messages* — I'll reply in both text and voice."
       );
       return new Response("ok", { status: 200 });
     }
@@ -157,7 +199,7 @@ export async function POST(req) {
     // /reset
     if (message.text && message.text.trim() === "/reset") {
       conversations.delete(chatId);
-      await sendTelegramMessage(
+      await sendTelegramText(
         chatId,
         "Memory wiped for this chat bro 🧹. We start fresh now."
       );
@@ -176,9 +218,9 @@ export async function POST(req) {
 
         if (!fileData.ok) {
           console.error("getFile error:", fileData);
-          await sendTelegramMessage(
+          await sendTelegramText(
             chatId,
-            "Bro, I couldn't access that voice message. Try again or type it out."
+            "Bro, I couldn't access that voice message. Try again or type it."
           );
           return new Response("ok", { status: 200 });
         }
@@ -193,7 +235,7 @@ export async function POST(req) {
             "Error downloading audio from Telegram:",
             audioRes.status
           );
-          await sendTelegramMessage(
+          await sendTelegramText(
             chatId,
             "Bro, I couldn't download that voice clearly. Can you send it again or type it?"
           );
@@ -206,7 +248,7 @@ export async function POST(req) {
         const transcript = await transcribeAudioBinary(audioArrayBuffer);
 
         if (transcript === "__NO_DEEPGRAM_KEY__") {
-          await sendTelegramMessage(
+          await sendTelegramText(
             chatId,
             "Bro, my speech brain (Deepgram) isn't configured on the server yet. Ask future-you to set DEEPGRAM_API_KEY in Vercel."
           );
@@ -214,7 +256,7 @@ export async function POST(req) {
         }
 
         if (!transcript) {
-          await sendTelegramMessage(
+          await sendTelegramText(
             chatId,
             "Bro, I couldn't understand that voice clearly. Can you send it again or type it?"
           );
@@ -228,11 +270,11 @@ export async function POST(req) {
           req
         );
 
-        await sendTelegramMessage(chatId, reply);
+        await sendJarvisReply(chatId, reply);
         return new Response("ok", { status: 200 });
       } catch (err) {
         console.error("Error handling voice message:", err);
-        await sendTelegramMessage(
+        await sendTelegramText(
           chatId,
           "Bro, something broke while processing that voice note. Try again or type it out."
         );
@@ -247,13 +289,13 @@ export async function POST(req) {
     }
 
     const reply = await askJarvisViaChatAPI(chatId, text, req);
-    await sendTelegramMessage(chatId, reply);
+    await sendJarvisReply(chatId, reply);
 
     return new Response("ok", { status: 200 });
   } catch (err) {
     console.error("Telegram webhook error:", err);
     if (chatId) {
-      await sendTelegramMessage(
+      await sendTelegramText(
         chatId,
         "Bro, something broke on the server side. Try again in a minute."
       );
