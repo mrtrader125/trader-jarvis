@@ -68,12 +68,19 @@ async function sendTelegramVoice(chatId, text) {
 
 // Combine: send text + voice reply
 async function sendJarvisReply(chatId, text) {
+  // 1) Send text
   await sendTelegramText(chatId, text);
-  // Fire & forget voice; even if TTS fails, user still sees text
-  sendTelegramVoice(chatId, text).catch((e) =>
-    console.error("sendJarvisReply voice error:", e)
-  );
+
+  // 2) Then generate & send voice for THIS same reply
+  //    We await it so order is always: text N -> voice N
+  try {
+    await sendTelegramVoice(chatId, text);
+  } catch (e) {
+    console.error("sendJarvisReply voice error:", e);
+    // silently fail – text is already delivered
+  }
 }
+
 
 // Transcribe Telegram voice file using Deepgram (sending audio bytes)
 async function transcribeAudioBinary(audioArrayBuffer) {
@@ -303,3 +310,4 @@ export async function POST(req) {
     return new Response("error", { status: 200 });
   }
 }
+
