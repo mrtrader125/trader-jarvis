@@ -53,8 +53,8 @@ async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
   form.append("chat_id", String(chatId));
 
   const blob = new Blob([audio], { type: "audio/ogg" });
-  // @ts-expect-error Node FormData typing is loose; this works at runtime
-  form.append("voice", blob, "jarvis.ogg");
+  // TS types for Node FormData are a bit loose, but this works at runtime
+  form.append("voice", blob as any, "jarvis.ogg");
 
   await fetch(
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
