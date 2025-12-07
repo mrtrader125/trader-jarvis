@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { groqClient } from "@/lib/groq";
 import { getNowInfo } from "@/lib/time";
 
-export const runtime = "nodejs"; // we need Node features (Buffer, FormData, etc.)
+export const runtime = "nodejs";
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -16,6 +16,19 @@ type TelegramUpdate = {
     date?: number;
   };
 };
+
+function isTimeQuestion(text: string | undefined | null): boolean {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  return (
+    q.includes("current time") ||
+    q.includes("time now") ||
+    q.includes("what's the time") ||
+    q.includes("whats the time") ||
+    q === "time?" ||
+    q === "time"
+  );
+}
 
 async function sendTelegramText(chatId: number, text: string) {
   if (!TELEGRAM_BOT_TOKEN) {
@@ -33,15 +46,15 @@ async function sendTelegramText(chatId: number, text: string) {
   );
 }
 
-async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
+async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
   if (!TELEGRAM_BOT_TOKEN) return;
 
   const form = new FormData();
   form.append("chat_id", String(chatId));
 
-  // Telegram accepts raw binary here; cast to any to satisfy TS in Node runtime
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  form.append("voice", audioBuffer as any, "jarvis.ogg");
+  const blob = new Blob([audio], { type: "audio/ogg" });
+  // @ts-expect-error Node FormData typing is loose; this works at runtime
+  form.append("voice", blob, "jarvis.ogg");
 
   await fetch(
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
@@ -52,14 +65,12 @@ async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
   );
 }
 
-
-async function synthesizeTTS(text: string): Promise<Buffer | null> {
+async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
   if (!DEEPGRAM_API_KEY) {
     console.error("Missing DEEPGRAM_API_KEY");
     return null;
   }
 
-  // You can change model or options here based on what you used before
   const res = await fetch(
     "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
     {
@@ -67,6 +78,7 @@ async function synthesizeTTS(text: string): Promise<Buffer | null> {
       headers: {
         Authorization: `Token ${DEEPGRAM_API_KEY}`,
         "Content-Type": "application/json",
+        Accept: "audio/ogg",
       },
       body: JSON.stringify({ text }),
     }
@@ -77,8 +89,7 @@ async function synthesizeTTS(text: string): Promise<Buffer | null> {
     return null;
   }
 
-  const arrayBuf = await res.arrayBuffer();
-  return Buffer.from(arrayBuf);
+  return await res.arrayBuffer();
 }
 
 export async function POST(req: NextRequest) {
@@ -87,7 +98,7 @@ export async function POST(req: NextRequest) {
     const message = update.message;
 
     if (!message || !message.text) {
-      return NextResponse.json({ ok: true }); // ignore non-text updates
+      return NextResponse.json({ ok: true });
     }
 
     const chatId = message.chat.id;
@@ -96,37 +107,46 @@ export async function POST(req: NextRequest) {
       (message.date ?? Math.floor(Date.now() / 1000)) * 1000
     ).toISOString();
 
-    // ---- Time awareness (same as web) ----
     const timezone = "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
+    // 🔐 HARD RULE: time questions get direct backend answer
+    if (isTimeQuestion(userText)) {
+      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+
+      await sendTelegramText(chatId, reply);
+      const audio = await synthesizeTTS(reply);
+      if (audio) {
+        await sendTelegramVoice(chatId, audio);
+      }
+
+      return NextResponse.json({ ok: true });
+    }
+
+    // Otherwise: use Groq + time metadata, but keep answers concise
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
 You are TIME-AWARE:
 
-- Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS ASKED):
+- Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
   - ISO: ${nowInfo.iso}
   - Local: ${nowInfo.localeString}
   - Timezone: ${nowInfo.timezone}
 
-The user message may be wrapped like:
+User text may be wrapped like:
   [sent_at: 2025-12-07T08:22:54.281Z] actual text...
 
-This tag is METADATA ONLY:
-- Use it to estimate how much time passed between events.
-- NEVER repeat the [sent_at: ...] tag or show it back to the user.
-- NEVER quote the full timestamp unless the user explicitly asks.
+This [sent_at: ...] tag is METADATA ONLY:
+- Use it to estimate how long it's been.
+- NEVER repeat the tag or show it to the user.
+- NEVER print the raw ISO timestamp.
 
 Behavior:
-- Only mention the current time/date if the user asks
-  ("what's the time", "current time", etc.).
-- Otherwise, use time implicitly ("it's late for you", "you've been away a while")
-  without dumping exact clocks.
-- Keep replies fairly concise for Telegram.
+- Keep replies short (1–3 sentences) unless the user asks for detail.
+- Use time implicitly (e.g., "it's late for you") without dumping exact clocks.
 `.trim();
 
-    // User message with hidden timestamp meta
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
 
     const completion = await groqClient.chat.completions.create({
@@ -140,15 +160,15 @@ Behavior:
 
     const replyText =
       completion.choices?.[0]?.message?.content ||
-      "Got it, bro. (No reply content from model).";
+      "Got it, bro.";
 
-    // 1) Send TEXT reply
+    // Send text
     await sendTelegramText(chatId, replyText);
 
-    // 2) Synthesize and send VOICE reply (best-effort)
-    const audioBuffer = await synthesizeTTS(replyText);
-    if (audioBuffer) {
-      await sendTelegramVoice(chatId, audioBuffer);
+    // Send voice (best effort)
+    const audio = await synthesizeTTS(replyText);
+    if (audio) {
+      await sendTelegramVoice(chatId, audio);
     }
 
     return NextResponse.json({ ok: true });
