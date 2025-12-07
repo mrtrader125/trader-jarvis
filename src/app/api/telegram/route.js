@@ -10,7 +10,7 @@ import { textToSpeechBuffer } from "@/lib/jarvis-tts";
 const conversations = new Map(); // chatId -> [{ role, content }, ...]
 const MAX_MESSAGES = 12;
 
-// --- Helpers ---
+// --- Telegram helpers ---
 
 async function sendTelegramText(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -36,7 +36,6 @@ async function sendTelegramText(chatId, text) {
   }
 }
 
-// Turn Jarvis reply text into a Telegram voice note
 async function sendTelegramVoice(chatId, text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
@@ -65,9 +64,8 @@ async function sendTelegramVoice(chatId, text) {
   }
 }
 
-// Combine: send text + voice reply
+// Always send text first, then voice for the SAME reply
 async function sendJarvisReply(chatId, text) {
-  // Keep order: text N, then voice N
   await sendTelegramText(chatId, text);
   try {
     await sendTelegramVoice(chatId, text);
@@ -76,7 +74,8 @@ async function sendJarvisReply(chatId, text) {
   }
 }
 
-// Transcribe Telegram voice file using Deepgram (sending audio bytes)
+// --- Deepgram STT helper ---
+
 async function transcribeAudioBinary(audioArrayBuffer) {
   const dgKey = process.env.DEEPGRAM_API_KEY;
   if (!dgKey) {
@@ -91,7 +90,7 @@ async function transcribeAudioBinary(audioArrayBuffer) {
         method: "POST",
         headers: {
           Authorization: `Token ${dgKey}`,
-          "Content-Type": "audio/ogg", // Telegram voice is OGG/OPUS
+          "Content-Type": "audio/ogg", // Telegram voice = OGG/OPUS
         },
         body: Buffer.from(audioArrayBuffer),
       }
@@ -112,24 +111,21 @@ async function transcribeAudioBinary(audioArrayBuffer) {
   }
 }
 
-// Call your existing /api/chat Jarvis brain with memory
+// --- Call Jarvis brain (/api/chat) with memory ---
+
 async function askJarvisViaChatAPI(chatId, userText) {
   let history = conversations.get(chatId) || [];
 
-  // Add current user message
+  // add current user message
   history = [...history, { role: "user", content: userText }];
 
-  // Trim short-term memory
+  // trim short-term memory
   if (history.length > MAX_MESSAGES) {
     history = history.slice(history.length - MAX_MESSAGES);
   }
 
-  // 👇 New, safer way to build base URL
-  const baseUrl =
-    process.env.NEXT_PUBLIC_SITE_URL ||
-    (process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000");
+  // HARD-CODED base URL of your deployed app
+  const baseUrl = "https://trader-jarvis.vercel.app";
 
   try {
     const res = await fetch(`${baseUrl}/api/chat`, {
@@ -153,7 +149,7 @@ async function askJarvisViaChatAPI(chatId, userText) {
       data.reply ||
       "Bro, my brain glitched for a sec while talking to the main server. Try again.";
 
-    // Add assistant reply to short-term memory
+    // add assistant reply to memory
     history = [...history, { role: "assistant", content: reply }];
 
     if (history.length > MAX_MESSAGES) {
@@ -169,7 +165,7 @@ async function askJarvisViaChatAPI(chatId, userText) {
   }
 }
 
-// --- Main handler ---
+// --- Main Telegram webhook handler ---
 
 export async function POST(req) {
   let chatId = null;
@@ -190,7 +186,7 @@ export async function POST(req) {
 
     chatId = message.chat.id;
 
-    // /id -> show chat id (for reminders etc.)
+    // /id -> return chat id
     if (message.text && message.text.trim() === "/id") {
       await sendTelegramText(chatId, `Your chat id is: \`${chatId}\``);
       return new Response("ok", { status: 200 });
@@ -205,7 +201,7 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // /reset
+    // /reset -> wipe short-term memory
     if (message.text && message.text.trim() === "/reset") {
       conversations.delete(chatId);
       await sendTelegramText(
@@ -215,12 +211,12 @@ export async function POST(req) {
       return new Response("ok", { status: 200 });
     }
 
-    // --- Voice message handling ---
+    // --- Voice message flow ---
     if (message.voice) {
       const fileId = message.voice.file_id;
 
       try {
-        // 1) Get file path from Telegram
+        // 1) get file path from Telegram
         const getFileUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`;
         const fileRes = await fetch(getFileUrl);
         const fileData = await fileRes.json();
@@ -237,7 +233,7 @@ export async function POST(req) {
         const filePath = fileData.result.file_path;
         const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
 
-        // 2) Download the audio ourselves
+        // 2) download audio
         const audioRes = await fetch(fileUrl);
         if (!audioRes.ok) {
           console.error(
@@ -253,7 +249,7 @@ export async function POST(req) {
 
         const audioArrayBuffer = await audioRes.arrayBuffer();
 
-        // 3) Transcribe via Deepgram (binary audio)
+        // 3) transcribe with Deepgram
         const transcript = await transcribeAudioBinary(audioArrayBuffer);
 
         if (transcript === "__NO_DEEPGRAM_KEY__") {
@@ -272,8 +268,11 @@ export async function POST(req) {
           return new Response("ok", { status: 200 });
         }
 
-        // 4) Send transcript through Jarvis brain
-        const reply = await askJarvisViaChatAPI(chatId, `(voice) ${transcript}`);
+        // 4) ask Jarvis with transcript
+        const reply = await askJarvisViaChatAPI(
+          chatId,
+          `(voice) ${transcript}`
+        );
         await sendJarvisReply(chatId, reply);
         return new Response("ok", { status: 200 });
       } catch (err) {
@@ -286,7 +285,7 @@ export async function POST(req) {
       }
     }
 
-    // --- Normal text message ---
+    // --- Text message flow ---
     const text = (message.text || "").trim();
     if (!text) {
       return new Response("No text", { status: 200 });
