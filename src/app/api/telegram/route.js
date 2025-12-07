@@ -53,7 +53,6 @@ async function sendTelegramVoice(chatId, text) {
     const form = new FormData();
     form.append("chat_id", String(chatId));
 
-    // Deepgram returns an ArrayBuffer; Blob accepts that directly
     const blob = new Blob([audioBuffer], { type: "audio/ogg" });
     form.append("voice", blob, "jarvis.ogg");
 
@@ -68,19 +67,14 @@ async function sendTelegramVoice(chatId, text) {
 
 // Combine: send text + voice reply
 async function sendJarvisReply(chatId, text) {
-  // 1) Send text
+  // Keep order: text N, then voice N
   await sendTelegramText(chatId, text);
-
-  // 2) Then generate & send voice for THIS same reply
-  //    We await it so order is always: text N -> voice N
   try {
     await sendTelegramVoice(chatId, text);
   } catch (e) {
     console.error("sendJarvisReply voice error:", e);
-    // silently fail – text is already delivered
   }
 }
-
 
 // Transcribe Telegram voice file using Deepgram (sending audio bytes)
 async function transcribeAudioBinary(audioArrayBuffer) {
@@ -119,7 +113,7 @@ async function transcribeAudioBinary(audioArrayBuffer) {
 }
 
 // Call your existing /api/chat Jarvis brain with memory
-async function askJarvisViaChatAPI(chatId, userText, req) {
+async function askJarvisViaChatAPI(chatId, userText) {
   let history = conversations.get(chatId) || [];
 
   // Add current user message
@@ -130,9 +124,12 @@ async function askJarvisViaChatAPI(chatId, userText, req) {
     history = history.slice(history.length - MAX_MESSAGES);
   }
 
-  const host = req.headers.get("host");
-  const proto = req.headers.get("x-forwarded-proto") || "https";
-  const baseUrl = `${proto}://${host}`;
+  // 👇 New, safer way to build base URL
+  const baseUrl =
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    (process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : "http://localhost:3000");
 
   try {
     const res = await fetch(`${baseUrl}/api/chat`, {
@@ -142,7 +139,12 @@ async function askJarvisViaChatAPI(chatId, userText, req) {
     });
 
     if (!res.ok) {
-      console.error("Error calling /api/chat from Telegram:", res.status);
+      const errorText = await res.text().catch(() => "");
+      console.error(
+        "Error calling /api/chat from Telegram:",
+        res.status,
+        errorText
+      );
       return "Bro, my brain had an issue reaching the main server. Try again in a bit.";
     }
 
@@ -271,12 +273,7 @@ export async function POST(req) {
         }
 
         // 4) Send transcript through Jarvis brain
-        const reply = await askJarvisViaChatAPI(
-          chatId,
-          `(voice) ${transcript}`,
-          req
-        );
-
+        const reply = await askJarvisViaChatAPI(chatId, `(voice) ${transcript}`);
         await sendJarvisReply(chatId, reply);
         return new Response("ok", { status: 200 });
       } catch (err) {
@@ -295,7 +292,7 @@ export async function POST(req) {
       return new Response("No text", { status: 200 });
     }
 
-    const reply = await askJarvisViaChatAPI(chatId, text, req);
+    const reply = await askJarvisViaChatAPI(chatId, text);
     await sendJarvisReply(chatId, reply);
 
     return new Response("ok", { status: 200 });
@@ -310,4 +307,3 @@ export async function POST(req) {
     return new Response("error", { status: 200 });
   }
 }
-
