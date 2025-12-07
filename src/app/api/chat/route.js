@@ -3,96 +3,95 @@
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
 
+// Use env override if you ever want to change models without touching code
+const MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+
+// Create Groq client once
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-// ---------- optional: safe Supabase logging (non-blocking) ----------
-async function logMessageToSupabase(entry) {
-  try {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
-
-    // Adjust table name / columns if your schema is different
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/jarvis_memory`, {
-      method: "POST",
-      headers: {
-        apikey: SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify(entry),
-    });
-
-    if (!res.ok) {
-      console.error("Supabase log error:", res.status, await res.text());
-    }
-  } catch (err) {
-    console.error("Supabase log exception:", err);
-  }
-}
-
-// ---------- health check (what you just called) ----------
+// ✅ Health check (GET /api/chat)
 export async function GET() {
-  return NextResponse.json({ ok: true, message: "Jarvis brain online" });
+  return NextResponse.json({
+    ok: true,
+    message: "Jarvis brain online",
+    hasKey: !!process.env.GROQ_API_KEY,
+  });
 }
 
-// ---------- main chat brain ----------
+// 🤖 Main Jarvis brain (POST /api/chat)
 export async function POST(req) {
   try {
+    // 1) Hard guard: no key
+    if (!process.env.GROQ_API_KEY) {
+      console.error("GROQ_API_KEY missing in POST /api/chat");
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "NO_API_KEY",
+          message:
+            "Bro, my brain is misconfigured locally. GROQ_API_KEY is missing. Check .env.local.",
+        },
+        { status: 500 }
+      );
+    }
+
+    // 2) Parse body safely
     const body = await req.json().catch(() => ({}));
 
-    const {
-      messages = [],
-      userId = "anonymous",
-      source = "web", // "web" | "telegram" | etc.
-      mode = "default",
-    } = body || {};
+    // We support multiple shapes:
+    // - { text: "hi" }
+    // - { message: "hi" }
+    // - { input: "hi" }
+    // - { messages: [{ role, content }, ...] }
+    let userText =
+      body.text ||
+      body.message ||
+      body.input ||
+      "";
 
-    if (!Array.isArray(messages) || messages.length === 0) {
+    let history = [];
+
+    if (!userText && Array.isArray(body.messages) && body.messages.length > 0) {
+      history = body.messages;
+      const last = body.messages[body.messages.length - 1];
+      userText = last?.content || "";
+    }
+
+    if (!userText) {
       return NextResponse.json(
-        { ok: false, error: "NO_MESSAGES" },
+        { ok: false, error: "NO_INPUT", message: "No message provided" },
         { status: 400 }
       );
     }
 
-    const latestUserMessage =
-      messages[messages.length - 1]?.content || "No content";
-
+    // 3) Build prompt
     const systemPrompt = `
-You are **Jarvis**, a friendly, casual trading & life companion for ONE specific user.
+You are Jarvis, a calm, supportive trading & life companion for one specific trader.
 
 Style:
-- Call him "bro" naturally, but not in every sentence.
-- Short, clear answers. No walls of text unless he asks for deep explanation.
-- Be emotionally supportive but honest about discipline, risk and rules.
+- Talk casual: "bro", "man" is fine, but not every sentence.
+- Short, clear paragraphs.
+- Focus on discipline, risk, emotional control and routine.
 
 Context:
-- He is a discretionary trader still working on discipline, focus and emotional control.
-- Help him stay within his rules, avoid FOMO/revenge trading, and keep risk small.
-- If he sounds stressed or tilted, focus more on mindset and routines than new trade ideas.
-
-When he talks about trading:
-- Ask clarifying questions before giving strong opinions.
-- Emphasise risk per trade, R:R, following his plan, and journaling.
-
-When he vents about life / emotions:
-- Listen first, validate the feeling, then gently give practical advice.
+- He's a discretionary trader working on consistency and avoiding FOMO / revenge.
+- When he's emotional, slow him down and get him back to his rules.
 `.trim();
 
     const groqMessages = [
       { role: "system", content: systemPrompt },
-      ...messages.map((m) => ({
+      ...history.map((m) => ({
         role: m.role === "assistant" ? "assistant" : "user",
         content: String(m.content ?? ""),
       })),
+      { role: "user", content: String(userText) },
     ];
 
+    // 4) Call Groq with the updated model
     const completion = await groq.chat.completions.create({
-      model: "llama-3.1-70b-versatile",
+      model: MODEL, // 👈 now using llama-3.3-70b-versatile by default
       messages: groqMessages,
       temperature: 0.7,
       max_tokens: 600,
@@ -100,41 +99,26 @@ When he vents about life / emotions:
 
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "Bro, I tried to answer but something glitched in my brain. Try again once more.";
+      "Bro, I tried to reply but something glitched. Say that again?";
 
-    // Fire-and-forget logging: last user + assistant reply
-    const timestamp = new Date().toISOString();
-
-    logMessageToSupabase({
-      user_id: userId,
-      source,
-      role: "user",
-      content: latestUserMessage,
-      created_at: timestamp,
-    }).catch(() => {});
-
-    logMessageToSupabase({
-      user_id: userId,
-      source,
-      role: "assistant",
-      content: reply,
-      created_at: timestamp,
-    }).catch(() => {});
-
-    return NextResponse.json({
-      ok: true,
-      reply,
-      mode,
-      source,
-    });
+    return NextResponse.json({ ok: true, reply });
   } catch (err) {
+    // 🔥 REAL DEBUG HERE
     console.error("Jarvis /api/chat error:", err);
+
+    const message =
+      err?.response?.data?.error?.message ||
+      err?.message ||
+      String(err);
+
+    // Send a clear error response
     return NextResponse.json(
       {
         ok: false,
         error: "JARVIS_BRAIN_ERROR",
         message:
           "Bro, my brain hit an error talking to the main server. Try again in a bit.",
+        debug: message, // 👈 This is what you saw in the Network tab
       },
       { status: 500 }
     );
