@@ -10,6 +10,8 @@ import {
   getUserProfileSummary,
   saveRule,
   saveBusinessPlan,
+  saveSystem,
+  getActiveSystem,
 } from "@/lib/supabase";
 
 const groq = new Groq({
@@ -76,10 +78,77 @@ export async function POST(req) {
 
     const rawUserText = String(userText || "");
     const userTextLower = toLowerSafe(rawUserText);
+    const trimmedText = rawUserText.trim();
 
     // -----------------------------------------------------------------------
-    // PROTOCOL DETECTION
+    // SPECIAL MODE: Save trading system via [TRADING_SYSTEM]
+    //
+    // Example:
+    // [TRADING_SYSTEM]
+    // Name: Golden Session v1
+    // 1) Only trade XAUUSD during London + NY overlap...
     // -----------------------------------------------------------------------
+    if (
+      hasSupabase &&
+      trimmedText.toUpperCase().startsWith("[TRADING_SYSTEM]")
+    ) {
+      const withoutTag = trimmedText
+        .replace(/^\[TRADING_SYSTEM\]/i, "")
+        .trim();
+
+      // Try to extract "Name: ..."
+      let name = "Trading System";
+      const nameMatch = withoutTag.match(/name\s*:\s*(.+)/i);
+      if (nameMatch && nameMatch[1]) {
+        name = nameMatch[1].trim();
+      }
+
+      const content = withoutTag;
+
+      const result = await saveSystem({
+        userId,
+        type: "trading_system",
+        name,
+        content,
+        status: "active",
+      });
+
+      if (hasSupabase) {
+        await logMemory({
+          userId,
+          channel,
+          type: "system",
+          content: `[TRADING_SYSTEM] Saved system "${name}"${
+            result?.version ? ` v${result.version}` : ""
+          }`,
+          importance: 3,
+        });
+      }
+
+      if (!result?.ok) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "SAVE_SYSTEM_FAILED",
+            message:
+              "I tried to save your trading system but something broke on the database side.",
+            debug: result?.reason || result?.error,
+          },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({
+        ok: true,
+        reply:
+          `Got it bro. I saved this as your active trading system (${name}, v${result.version}). ` +
+          `From now on, when you ask about trades or setups, I'll judge them according to this system.`,
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // PROTOCOL DETECTION (rules / business plans / generic chat)
+// -----------------------------------------------------------------------
     let memoryType = "chat";
     let memoryImportance = 1;
     const memoryTags = [];
@@ -109,19 +178,22 @@ export async function POST(req) {
     }
 
     // -----------------------------------------------------------------------
-    // Fetch profile + recent memories
-    // -----------------------------------------------------------------------
+// Fetch profile + recent memories + active trading system
+// -----------------------------------------------------------------------
     let profileSummary = null;
     let recentMemories = [];
+    let activeSystem = null;
 
     if (hasSupabase) {
-      const [profileRow, recent] = await Promise.all([
+      const [profileRow, recent, systemRow] = await Promise.all([
         getUserProfileSummary(userId),
         getRecentMemories({ userId, limit: 10 }),
+        getActiveSystem({ userId, type: "trading_system" }),
       ]);
 
       profileSummary = profileRow;
       recentMemories = Array.isArray(recent) ? recent : [];
+      activeSystem = systemRow || null;
     }
 
     const memoryText =
@@ -130,7 +202,7 @@ export async function POST(req) {
         : "";
 
     // -----------------------------------------------------------------------
-    // System prompt + protocols
+    // System prompt + protocols + trading system
     // -----------------------------------------------------------------------
     const systemParts = [
       `You are Jarvis, a calm, supportive trading & life companion for ONE specific trader.`,
@@ -152,6 +224,20 @@ export async function POST(req) {
         `Long-term profile about this user (summarised from many conversations). Use this to stay consistent with who he is:
 
 ${profileSummary}`
+      );
+    }
+
+    if (activeSystem?.content) {
+      systemParts.push(
+        `ACTIVE TRADING SYSTEM (from the user's saved configuration):
+
+${activeSystem.content}
+
+When giving any trade, risk, or setup advice:
+- First, interpret his idea strictly through this system.
+- Tell him clearly whether his idea FOLLOWS or BREAKS his own rules.
+- If he is breaking his rules, warn him firmly but supportively.
+- Never invent a new system; always respect this one unless he says he changed it.`
       );
     }
 
@@ -270,7 +356,9 @@ ${memoryText}`
       // Also save into structured tables for long-term use
       if (memoryType === "rule") {
         const cleaned = rawUserText.replace(/^(\s*jarvis[, ]*)?/i, "");
-        const noPrefix = cleaned.replace(/^(\s*new rule:|\s*rule:)/i, "").trim();
+        const noPrefix = cleaned
+          .replace(/^(\s*new rule:|\s*rule:)/i, "")
+          .trim();
         const title =
           noPrefix.slice(0, 120) ||
           cleaned.slice(0, 120) ||
@@ -285,7 +373,9 @@ ${memoryText}`
         });
       } else if (memoryType === "business_plan") {
         const cleaned = rawUserText.replace(/^(\s*jarvis[, ]*)?/i, "");
-        const titleMatch = cleaned.match(/(plan|idea|project)[:\-]\s*(.+)$/i);
+        const titleMatch = cleaned.match(
+          /(plan|idea|project)[:\-]\s*(.+)$/i
+        );
         const title =
           (titleMatch && titleMatch[2]?.slice(0, 120)) ||
           cleaned.slice(0, 120) ||
