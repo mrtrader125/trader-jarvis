@@ -12,12 +12,11 @@ if (!supabaseServiceRoleKey) {
   throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY in environment variables");
 }
 
-// ❗ This client is for SERVER-SIDE USE ONLY.
-// Do NOT import this in client components.
+// ❗ Server-side Supabase client ONLY.
+// Do not import this from Client Components or the browser.
 export function createClient() {
-  return createSupabaseClient(supabaseUrl!, supabaseServiceRoleKey!, {
+  return createSupabaseClient(supabaseUrl, supabaseServiceRoleKey, {
     auth: {
-      // We are using the service role key on the server, so we don't rely on browser sessions here.
       persistSession: false,
     },
   });
