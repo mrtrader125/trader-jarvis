@@ -4,9 +4,6 @@ import { createClient } from "@/lib/supabase/server";
 import { getNowInfo } from "@/lib/time";
 import { groqClient } from "@/lib/groq";
 
-// If you want edge runtime later, we can switch; for now keep default Node runtime.
-// export const runtime = "edge";
-
 type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
@@ -72,7 +69,9 @@ Current real-world time:
 User routine (from jarvis_profile, if available):
 - Typical wake time: ${profile?.typical_wake_time ?? "unknown"}
 - Typical sleep time: ${profile?.typical_sleep_time ?? "unknown"}
-- Trading session: ${profile?.trading_session_start ?? "unknown"} - ${profile?.trading_session_end ?? "unknown"}
+- Trading session: ${profile?.trading_session_start ?? "unknown"} - ${
+      profile?.trading_session_end ?? "unknown"
+    }
 
 Personality:
 - Strictness level: ${profile?.strictness_level ?? 7}/10
@@ -92,4 +91,44 @@ Rules:
     ];
 
     // ---- 6) Call Groq LLM ----
-    const completion = await groqClient.chat.comple
+    const completion = await groqClient.chat.completions.create({
+      model: "mixtral-8x7b-32768", // change if you're using another model
+      messages: finalMessages,
+      stream: false,
+    });
+
+    const replyMessage = completion.choices?.[0]?.message as any;
+
+    const replyContent =
+      typeof replyMessage?.content === "string"
+        ? replyMessage.content
+        : Array.isArray(replyMessage?.content)
+        ? replyMessage.content
+            .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
+            .join("\n")
+        : "Sorry, I couldn't generate a response.";
+
+    // ---- 7) Return JSON to the frontend ----
+    return NextResponse.json(
+      {
+        reply: replyContent,
+        raw: replyMessage,
+        now: nowInfo,
+        profileUsed: !!profile,
+      },
+      { status: 200 }
+    );
+  } catch (error: unknown) {
+    console.error("Error in /api/chat:", error);
+    const message =
+      error instanceof Error ? error.message : String(error);
+
+    return NextResponse.json(
+      {
+        error: "Jarvis brain API crashed.",
+        details: message,
+      },
+      { status: 500 }
+    );
+  }
+}
