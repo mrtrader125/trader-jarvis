@@ -1,15 +1,35 @@
 // src/lib/time.ts
 
-// Simple helper to get "now" information in a given timezone
-export function getNowInfo(timezone: string) {
+export type NowInfo = {
+  iso: string;
+  timezone: string;
+  timeString: string;   // e.g. "1:57:12 am"
+  dateString: string;   // e.g. "8/12/2025"
+  localeString: string; // e.g. "8/12/2025, 1:57:12 am"
+};
+
+export function getNowInfo(timezone: string): NowInfo {
   const now = new Date();
 
-  const iso = now.toISOString();
-  const localeString = now.toLocaleString("en-IN", { timeZone: timezone });
+  const timeString = now.toLocaleTimeString("en-IN", {
+    timeZone: timezone,
+    hour12: true,
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const dateString = now.toLocaleDateString("en-IN", {
+    timeZone: timezone,
+  });
+
+  const localeString = `${dateString}, ${timeString}`;
 
   return {
-    iso,           // "2025-12-07T16:30:21.000Z"
-    localeString,  // "07/12/2025, 10:00 pm" (for Asia/Kolkata)
+    iso: now.toISOString(),
     timezone,
+    timeString,
+    dateString,
+    localeString,
   };
 }
