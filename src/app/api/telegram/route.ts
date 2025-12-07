@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { groqClient } from "@/lib/groq";
 import { getNowInfo } from "@/lib/time";
 
+export const runtime = "nodejs"; // we need Node features (Buffer, FormData, etc.)
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
 type TelegramUpdate = {
   message?: {
@@ -14,20 +17,68 @@ type TelegramUpdate = {
   };
 };
 
-async function sendTelegramMessage(chatId: number, text: string) {
+async function sendTelegramText(chatId: number, text: string) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
     return;
   }
 
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-    }),
-  });
+  await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    }
+  );
+}
+
+async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(
+    "voice",
+    new Blob([audioBuffer], { type: "audio/ogg" }),
+    "jarvis.ogg"
+  );
+
+  await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
+    {
+      method: "POST",
+      body: form as any,
+    }
+  );
+}
+
+async function synthesizeTTS(text: string): Promise<Buffer | null> {
+  if (!DEEPGRAM_API_KEY) {
+    console.error("Missing DEEPGRAM_API_KEY");
+    return null;
+  }
+
+  // You can change model or options here based on what you used before
+  const res = await fetch(
+    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${DEEPGRAM_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text }),
+    }
+  );
+
+  if (!res.ok) {
+    console.error("Deepgram TTS error:", await res.text());
+    return null;
+  }
+
+  const arrayBuf = await res.arrayBuffer();
+  return Buffer.from(arrayBuf);
 }
 
 export async function POST(req: NextRequest) {
@@ -36,18 +87,19 @@ export async function POST(req: NextRequest) {
     const message = update.message;
 
     if (!message || !message.text) {
-      return NextResponse.json({ ok: true }); // ignore non-text
+      return NextResponse.json({ ok: true }); // ignore non-text updates
     }
 
     const chatId = message.chat.id;
     const userText = message.text;
-    const sentAtIso = new Date((message.date ?? Date.now()) * 1000).toISOString();
+    const sentAtIso = new Date(
+      (message.date ?? Math.floor(Date.now() / 1000)) * 1000
+    ).toISOString();
 
-    // 1) Time info (same as web)
+    // ---- Time awareness (same as web) ----
     const timezone = "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
-    // 2) System prompt: time-aware but don't leak metadata
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
@@ -58,24 +110,23 @@ You are TIME-AWARE:
   - Local: ${nowInfo.localeString}
   - Timezone: ${nowInfo.timezone}
 
-The user message may start with a tag like:
-  [sent_at: 2025-12-07T08:22:54.281Z]
+The user message may be wrapped like:
+  [sent_at: 2025-12-07T08:22:54.281Z] actual text...
 
 This tag is METADATA ONLY:
 - Use it to estimate how much time passed between events.
-- NEVER repeat this tag or show it back to the user.
+- NEVER repeat the [sent_at: ...] tag or show it back to the user.
 - NEVER quote the full timestamp unless the user explicitly asks.
 
 Behavior:
-- Only mention the current time/date if the user asks things like
-  "what's the time", "what time is it", "what day is it", or
-  "how long has it been".
-- Otherwise, use time implicitly ("it's late for you", "you've been away from
-  the market for a bit") without dumping exact clocks.
-- Keep responses short and Telegram-friendly: no huge essays unless the user asks.
+- Only mention the current time/date if the user asks
+  ("what's the time", "current time", etc.).
+- Otherwise, use time implicitly ("it's late for you", "you've been away a while")
+  without dumping exact clocks.
+- Keep replies fairly concise for Telegram.
 `.trim();
 
-    // 3) User message with hidden timestamp metadata
+    // User message with hidden timestamp meta
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
 
     const completion = await groqClient.chat.completions.create({
@@ -87,15 +138,22 @@ Behavior:
       stream: false,
     });
 
-    const reply = completion.choices?.[0]?.message?.content || "Got it, bro.";
+    const replyText =
+      completion.choices?.[0]?.message?.content ||
+      "Got it, bro. (No reply content from model).";
 
-    // 4) Send back to Telegram
-    await sendTelegramMessage(chatId, reply);
+    // 1) Send TEXT reply
+    await sendTelegramText(chatId, replyText);
+
+    // 2) Synthesize and send VOICE reply (best-effort)
+    const audioBuffer = await synthesizeTTS(replyText);
+    if (audioBuffer) {
+      await sendTelegramVoice(chatId, audioBuffer);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
-    console.error("TELEGRAM API ERROR:", err);
-    // We can't show this to the user easily, but keep Telegram webhook happy
+    console.error("TELEGRAM WEBHOOK ERROR:", err);
     return NextResponse.json({ ok: true });
   }
 }
