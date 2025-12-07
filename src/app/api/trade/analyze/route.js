@@ -8,7 +8,7 @@ import {
   getUserProfileSummary,
 } from "@/lib/supabase";
 
-const MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
