@@ -1,7 +1,7 @@
 // src/app/api/memory/summary/route.js
-
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
+import { PRIMARY_USER_ID } from "@/lib/constants";
 import {
   supabase,
   hasSupabase,
@@ -9,20 +9,18 @@ import {
   getUserProfileSummary,
   upsertUserProfileSummary,
 } from "@/lib/supabase";
-import { PRIMARY_USER_ID } from "@/lib/constants";
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-
-// Single canonical user id (same as chat)
-const DEFAULT_USER_ID = PRIMARY_USER_ID;
+const GROQ_MODEL =
+  process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // ---------------------------------------------------------------------
 // GET /api/memory/summary
-// Manually trigger a profile refresh (also used by cron).
+// Manually or via cron: refresh long-term profile summary
+// AND trigger /api/journal/daily in the background.
 // ---------------------------------------------------------------------
 export async function GET() {
   try {
@@ -48,9 +46,9 @@ export async function GET() {
       );
     }
 
-    const userId = DEFAULT_USER_ID;
+    const userId = PRIMARY_USER_ID;
 
-    // 1) Existing long-term profile
+    // 1) Existing long-term profile (string summary)
     const existingSummary = await getUserProfileSummary(userId);
 
     // 2) Recent memories (bigger slice than chat)
@@ -139,11 +137,42 @@ Now produce a **new, updated long-term summary** following the rules.
       );
     }
 
+    // 3) Save new long-term profile
     await upsertUserProfileSummary(newSummary, userId);
+
+    // 4) Fire-and-forget: also trigger daily journal
+    //    Uses either JARVIS_BASE_URL or VERCEL_URL
+    const baseUrl =
+      process.env.JARVIS_BASE_URL ||
+      (process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : null);
+
+    if (baseUrl) {
+      try {
+        // Don't await the response for too long – just trigger it.
+        fetch(`${baseUrl}/api/journal/daily`).catch((err) => {
+          console.error(
+            "Failed to trigger /api/journal/daily from summary:",
+            err
+          );
+        });
+      } catch (err) {
+        console.error(
+          "Error scheduling /api/journal/daily from summary:",
+          err
+        );
+      }
+    } else {
+      console.warn(
+        "No base URL set (JARVIS_BASE_URL or VERCEL_URL); daily journal not auto-triggered."
+      );
+    }
 
     return NextResponse.json({
       ok: true,
-      message: "Profile summary updated.",
+      message:
+        "Profile summary updated (and daily journal triggered if base URL is configured).",
       length: newSummary.length,
     });
   } catch (err) {
