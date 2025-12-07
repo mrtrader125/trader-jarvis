@@ -1,9 +1,16 @@
+// src/lib/jarvis-tts.js
+// Turn Jarvis text into an audio buffer using Deepgram TTS
+
 export async function textToSpeechBuffer(text) {
   const dgKey = process.env.DEEPGRAM_API_KEY;
   if (!dgKey) {
     console.error("Missing DEEPGRAM_API_KEY for TTS");
     return null;
   }
+
+  // Keep audio reasonably short
+  const trimmed =
+    text.length > 600 ? text.slice(0, 600) + " ... (truncated)" : text;
 
   try {
     const res = await fetch(
@@ -13,8 +20,11 @@ export async function textToSpeechBuffer(text) {
         headers: {
           Authorization: `Token ${dgKey}`,
           "Content-Type": "application/json",
+          Accept: "audio/ogg",
         },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({
+          text: trimmed,
+        }),
       }
     );
 
