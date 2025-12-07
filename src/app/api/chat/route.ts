@@ -10,23 +10,45 @@ type ChatMessage = {
   created_at?: string;
 };
 
+function isTimeQuestion(text: string | undefined | null): boolean {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  return (
+    q.includes("current time") ||
+    q.includes("time now") ||
+    q.includes("what's the time") ||
+    q.includes("whats the time") ||
+    q === "time?" ||
+    q === "time"
+  );
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const messages: ChatMessage[] = body?.messages ?? [];
 
-    // 1) Use your local timezone (we can later load from DB)
     const timezone = "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
-    // 2) Attach timestamps ONLY as hidden meta for the model
+    const lastMessage = messages[messages.length - 1];
+    const lastUserContent =
+      lastMessage?.role === "user" ? lastMessage.content : undefined;
+
+    // 🔐 HARD RULE: questions about current time are answered by backend, not LLM
+    if (isTimeQuestion(lastUserContent)) {
+      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      return NextResponse.json({ reply }, { status: 200 });
+    }
+
+    // ---- For all other messages, keep time internal for Jarvis ----
+
     const messagesWithTime = messages.map((m) => {
       const sentAt =
         m.createdAt ||
         m.created_at ||
         new Date().toISOString();
 
-      // Add [sent_at: ...] ONLY to user messages, keep assistant text clean
       if (m.role === "user") {
         return {
           role: m.role,
@@ -34,40 +56,34 @@ export async function POST(req: NextRequest) {
         };
       }
 
-      // For assistant/system, pass content as-is
       return {
         role: m.role,
         content: m.content,
       };
     });
 
-    // 3) System prompt: Jarvis knows the time but keeps it internal
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user.
 
 You are TIME-AWARE:
 
-- Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS ASKED):
+- Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
   - ISO: ${nowInfo.iso}
   - Local: ${nowInfo.localeString}
   - Timezone: ${nowInfo.timezone}
 
-You will see user messages sometimes start with tags like:
-  [sent_at: 2025-12-08T01:21:27.232Z]
+User messages may include tags like:
+  [sent_at: 2025-12-08T01:57:12.000Z] message...
 
-Those tags are METADATA ONLY:
-- Use them to estimate how much time passed between events.
-- NEVER repeat these tags or show them in your reply.
-- NEVER quote the full timestamp unless the user specifically asks.
+These tags are METADATA ONLY:
+- Use them to estimate how long it's been since the last message.
+- NEVER repeat the [sent_at: ...] tags or show them in your reply.
+- NEVER quote the full ISO timestamp.
 
-Behavior rules:
-- Only mention the current time or date if the user explicitly asks
-  ("what time is it", "what day is it", "how long has it been", etc.).
-- Otherwise, use time implicitly to give better guidance
-  (e.g., "it's late for you", "you've been away from the market for a few hours")
-  WITHOUT dumping exact clock/timestamps unless necessary.
-- Stay supportive but honest, always pulling the user back to their trading
-  rules, routine, and emotional discipline.
+Behavior:
+- Only mention the current time/date if the user explicitly asks.
+- Otherwise, use time implicitly ("it's late for you", etc.) without dumping exact clocks.
+- Stay supportive but honest, always pulling the user back to their trading rules and routine.
 `.trim();
 
     const finalMessages = [
@@ -75,7 +91,6 @@ Behavior rules:
       ...messagesWithTime,
     ];
 
-    // 4) Call Groq
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: finalMessages,
@@ -99,7 +114,6 @@ Behavior rules:
     const message =
       error instanceof Error ? error.message : String(error);
 
-    // Return 200 so UI doesn't freak out; show error as Jarvis text
     return NextResponse.json(
       { reply: "Jarvis brain crashed: " + message },
       { status: 200 }
