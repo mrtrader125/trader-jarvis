@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { groqClient } from "@/lib/groq";
 import { getNowInfo } from "@/lib/time";
+import { createClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
 
@@ -53,7 +54,6 @@ async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
   form.append("chat_id", String(chatId));
 
   const blob = new Blob([audio], { type: "audio/ogg" });
-  // TS types for Node FormData are a bit loose, but this works at runtime
   form.append("voice", blob as any, "jarvis.ogg");
 
   await fetch(
@@ -107,44 +107,105 @@ export async function POST(req: NextRequest) {
       (message.date ?? Math.floor(Date.now() / 1000)) * 1000
     ).toISOString();
 
-    const timezone = "Asia/Kolkata";
+    // ---- 1) Load Jarvis profile (single-user) ----
+    const supabase = createClient();
+    let profile: any = null;
+
+    try {
+      const { data, error } = await supabase
+        .from("jarvis_profile")
+        .select("*")
+        .eq("user_id", "single-user")
+        .single();
+
+      if (error) {
+        console.error("Error loading jarvis_profile:", error.message);
+      } else {
+        profile = data;
+      }
+    } catch (err) {
+      console.error("Exception loading jarvis_profile:", err);
+    }
+
+    const timezone: string = profile?.timezone || "Asia/Kolkata";
+
     const nowInfo = getNowInfo(timezone);
 
-    // 🔐 HARD RULE: time questions get direct backend answer
+    const displayName = profile?.display_name || "Bro";
+    const bio =
+      profile?.bio ||
+      "Disciplined trader building systems to control impulses and grow steadily.";
+    const mainGoal =
+      profile?.main_goal ||
+      "Become a consistently profitable, rule-based trader.";
+    const currentFocus =
+      profile?.current_focus || "December: Discipline over profits.";
+
+    const typicalWake = profile?.typical_wake_time || "06:30";
+    const typicalSleep = profile?.typical_sleep_time || "23:30";
+    const sessionStart = profile?.trading_session_start || "09:15";
+    const sessionEnd = profile?.trading_session_end || "15:30";
+
+    const strictness = profile?.strictness_level ?? 8;
+    const empathy = profile?.empathy_level ?? 7;
+    const humor = profile?.humor_level ?? 5;
+
+    // 🔐 2) Direct time questions → backend answer
     if (isTimeQuestion(userText)) {
       const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
 
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
-      if (audio) {
-        await sendTelegramVoice(chatId, audio);
-      }
+      if (audio) await sendTelegramVoice(chatId, audio);
 
       return NextResponse.json({ ok: true });
     }
 
-    // Otherwise: use Groq + time metadata, but keep answers concise
+    // ---- 3) Build system prompt with routine + sliders ----
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
-You are TIME-AWARE:
+USER ID: "single-user"
 
-- Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
-  - ISO: ${nowInfo.iso}
-  - Local: ${nowInfo.localeString}
-  - Timezone: ${nowInfo.timezone}
+User identity:
+- Name: ${displayName}
+- Bio: ${bio}
+- Main goal: ${mainGoal}
+- Current focus: ${currentFocus}
 
-User text may be wrapped like:
+User routine:
+- Timezone: ${timezone}
+- Typical wake time: ${typicalWake}
+- Typical sleep time: ${typicalSleep}
+- Trading session: ${sessionStart} - ${sessionEnd}
+
+Personality sliders (0–10):
+- Strictness: ${strictness}
+- Empathy: ${empathy}
+- Humor: ${humor}
+
+Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
+- ISO: ${nowInfo.iso}
+- Local: ${nowInfo.localeString}
+- Timezone: ${nowInfo.timezone}
+
+[sent_at: ...] TAG:
+- The user text may be wrapped as:
   [sent_at: 2025-12-07T08:22:54.281Z] actual text...
+- This tag is METADATA ONLY.
+- Use it to estimate how long it's been since the last message.
+- NEVER repeat the [sent_at: ...] tag or show raw ISO timestamps.
 
-This [sent_at: ...] tag is METADATA ONLY:
-- Use it to estimate how long it's been.
-- NEVER repeat the tag or show it to the user.
-- NEVER print the raw ISO timestamp.
-
-Behavior:
+BEHAVIOR:
 - Keep replies short (1–3 sentences) unless the user asks for detail.
-- Use time implicitly (e.g., "it's late for you") without dumping exact clocks.
+- Use routine intelligently:
+  - If it's very late for them, nudge them toward rest.
+  - During trading hours, focus on prep, execution, and discipline.
+  - If they are trading outside the normal session, warn about impulse decisions.
+- Adjust tone by sliders:
+  - More strictness → more firm about rules.
+  - More empathy → more emotional validation.
+  - More humor → light but still focused, no clowning around.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
@@ -159,17 +220,12 @@ Behavior:
     });
 
     const replyText =
-      completion.choices?.[0]?.message?.content ||
-      "Got it, bro.";
+      completion.choices?.[0]?.message?.content || "Got it, bro.";
 
-    // Send text
     await sendTelegramText(chatId, replyText);
 
-    // Send voice (best effort)
     const audio = await synthesizeTTS(replyText);
-    if (audio) {
-      await sendTelegramVoice(chatId, audio);
-    }
+    if (audio) await sendTelegramVoice(chatId, audio);
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
