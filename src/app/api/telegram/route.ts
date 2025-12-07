@@ -31,6 +31,11 @@ function isTimeQuestion(text: string | undefined | null): boolean {
   );
 }
 
+// Remove any leading [sent_at: ...] tag the model might output
+function stripSentAtPrefix(text: string): string {
+  return text.replace(/^\s*\[sent_at:[^\]]*\]\s*/i, "");
+}
+
 async function sendTelegramText(chatId: number, text: string) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
@@ -128,7 +133,6 @@ export async function POST(req: NextRequest) {
     }
 
     const timezone: string = profile?.timezone || "Asia/Kolkata";
-
     const nowInfo = getNowInfo(timezone);
 
     const displayName = profile?.display_name || "Bro";
@@ -152,7 +156,8 @@ export async function POST(req: NextRequest) {
 
     // 🔐 2) Direct time questions → backend answer
     if (isTimeQuestion(userText)) {
-      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const reply = stripSentAtPrefix(replyRaw);
 
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
@@ -195,17 +200,7 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 - This tag is METADATA ONLY.
 - Use it to estimate how long it's been since the last message.
 - NEVER repeat the [sent_at: ...] tag or show raw ISO timestamps.
-
-BEHAVIOR:
-- Keep replies short (1–3 sentences) unless the user asks for detail.
-- Use routine intelligently:
-  - If it's very late for them, nudge them toward rest.
-  - During trading hours, focus on prep, execution, and discipline.
-  - If they are trading outside the normal session, warn about impulse decisions.
-- Adjust tone by sliders:
-  - More strictness → more firm about rules.
-  - More empathy → more emotional validation.
-  - More humor → light but still focused, no clowning around.
+- DO NOT invent your own [sent_at: ...] prefix in replies.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
@@ -219,8 +214,10 @@ BEHAVIOR:
       stream: false,
     });
 
-    const replyText =
+    const rawReply =
       completion.choices?.[0]?.message?.content || "Got it, bro.";
+
+    const replyText = stripSentAtPrefix(rawReply);
 
     await sendTelegramText(chatId, replyText);
 
