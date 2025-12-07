@@ -18,18 +18,17 @@ export const supabase = hasSupabase
   : null;
 
 // ---------------------------------------------------------------------------
-// Tables
+// Table names
 // ---------------------------------------------------------------------------
-
 const MEMORY_TABLE = "jarvis_memory";
 const PROFILE_TABLE = "jarvis_profile";
+const JOURNAL_TABLE = "jarvis_journal";
+const RULES_TABLE = "jarvis_rules";
+const PLANS_TABLE = "jarvis_plans";
 
 // ---------------------------------------------------------------------------
-// Helpers: memory table (jarvis_memory)
-// columns: id (uuid, default), user_id text, channel text, type text,
-//          content text, importance int2, created_at timestamptz default now()
+// Raw memory log (jarvis_memory)
 // ---------------------------------------------------------------------------
-
 export async function logMemory({
   userId,
   channel = "web",
@@ -84,45 +83,33 @@ export async function getRecentMemories({
   }
 }
 
-/**
- * getMemoriesSince
- * Used by the daily journal API to pull memories from a given timestamp.
- *
- * options:
- * - userId (required)
- * - since  (required) Date | string (ISO)
- * - minImportance (default 1)
- * - type        (optional filter, e.g. "chat" / "journal")
- * - channel     (optional filter, e.g. "web" / "telegram")
- */
 export async function getMemoriesSince({
   userId,
   since,
   minImportance = 1,
-  type,
-  channel,
+  types,
 }) {
-  if (!supabase || !hasSupabase || !userId || !since) return [];
+  if (!supabase || !hasSupabase) return [];
 
   try {
     let query = supabase
       .from(MEMORY_TABLE)
       .select("*")
-      .eq("user_id", userId)
-      .gte("created_at", since)
-      .gte("importance", minImportance)
-      .order("created_at", { ascending: true });
+      .eq("user_id", userId);
 
-    if (type) {
-      query = query.eq("type", type);
+    if (since) {
+      query = query.gte("created_at", since);
+    }
+    if (minImportance != null) {
+      query = query.gte("importance", minImportance);
+    }
+    if (Array.isArray(types) && types.length) {
+      query = query.in("type", types);
     }
 
-    if (channel) {
-      query = query.eq("channel", channel);
-    }
+    query = query.order("created_at", { ascending: true });
 
     const { data, error } = await query;
-
     if (error) {
       console.error("getMemoriesSince supabase error:", error);
       return [];
@@ -135,41 +122,40 @@ export async function getMemoriesSince({
   }
 }
 
-/**
- * logJournalEntry
- * Used by the daily journal API. Under the hood this just logs into
- * jarvis_memory with type = "journal" so we don't need a separate table.
- *
- * options:
- * - userId (required)
- * - channel (default "web" / "telegram" etc.)
- * - content (required)  -> the final journal text / summary
- * - importance (default 1)
- */
+// ---------------------------------------------------------------------------
+// Auto daily journal (jarvis_journal)
+// ---------------------------------------------------------------------------
 export async function logJournalEntry({
   userId,
-  channel = "web",
-  content,
-  importance = 1,
+  entryDate,
+  title,
+  summary,
 }) {
   if (!supabase || !hasSupabase) return;
-  if (!userId || !content) return;
 
-  // Re-use logMemory but mark these as "journal"
-  return logMemory({
-    userId,
-    channel,
-    type: "journal",
-    content,
-    importance,
-  });
+  try {
+    const payload = {
+      user_id: userId,
+      entry_date: entryDate,
+      title,
+      summary,
+    };
+
+    const { error } = await supabase
+      .from(JOURNAL_TABLE)
+      .upsert(payload, { onConflict: "user_id,entry_date" });
+
+    if (error) {
+      console.error("logJournalEntry supabase error:", error);
+    }
+  } catch (err) {
+    console.error("logJournalEntry unexpected error:", err);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: long-term profile table (jarvis_profile)
-// columns: user_id text PK, summary text, updated_at timestamptz default now()
+// Long-term profile (jarvis_profile)
 // ---------------------------------------------------------------------------
-
 export async function getUserProfileSummary(userId) {
   if (!supabase || !hasSupabase) return null;
 
@@ -200,7 +186,7 @@ export async function upsertUserProfileSummary(summary, userId) {
       {
         user_id: userId,
         summary,
-        // updated_at will auto-default to now() if you set default in schema
+        // updated_at column in DB should have default now()
       },
       {
         onConflict: "user_id",
@@ -212,5 +198,109 @@ export async function upsertUserProfileSummary(summary, userId) {
     }
   } catch (err) {
     console.error("upsertUserProfileSummary unexpected error:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rules (jarvis_rules)
+// ---------------------------------------------------------------------------
+export async function saveRule({
+  userId,
+  title,
+  body,
+  source = "web",
+  rawInput,
+}) {
+  if (!supabase || !hasSupabase) return;
+
+  try {
+    const { error } = await supabase.from(RULES_TABLE).insert({
+      user_id: userId,
+      title,
+      body,
+      source,
+      raw_input: rawInput ?? null,
+    });
+
+    if (error) {
+      console.error("saveRule supabase error:", error);
+    }
+  } catch (err) {
+    console.error("saveRule unexpected error:", err);
+  }
+}
+
+export async function listRules({ userId, limit = 50 } = {}) {
+  if (!supabase || !hasSupabase) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from(RULES_TABLE)
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error("listRules supabase error:", error);
+      return [];
+    }
+
+    return data || [];
+  } catch (err) {
+    console.error("listRules unexpected error:", err);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Business plans (jarvis_plans)
+// ---------------------------------------------------------------------------
+export async function saveBusinessPlan({
+  userId,
+  title,
+  summary,
+  detail,
+  source = "web",
+}) {
+  if (!supabase || !hasSupabase) return;
+
+  try {
+    const { error } = await supabase.from(PLANS_TABLE).insert({
+      user_id: userId,
+      title,
+      summary,
+      detail: detail ?? null,
+      source,
+    });
+
+    if (error) {
+      console.error("saveBusinessPlan supabase error:", error);
+    }
+  } catch (err) {
+    console.error("saveBusinessPlan unexpected error:", err);
+  }
+}
+
+export async function listBusinessPlans({ userId, limit = 50 } = {}) {
+  if (!supabase || !hasSupabase) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from(PLANS_TABLE)
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error("listBusinessPlans supabase error:", error);
+      return [];
+    }
+
+    return data || [];
+  } catch (err) {
+    console.error("listBusinessPlans unexpected error:", err);
+    return [];
   }
 }
