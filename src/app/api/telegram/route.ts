@@ -38,11 +38,10 @@ async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
 
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  form.append(
-    "voice",
-    new Blob([audioBuffer], { type: "audio/ogg" }),
-    "jarvis.ogg"
-  );
+
+  // Telegram accepts raw binary here; cast to any to satisfy TS in Node runtime
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  form.append("voice", audioBuffer as any, "jarvis.ogg");
 
   await fetch(
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
@@ -52,6 +51,7 @@ async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
     }
   );
 }
+
 
 async function synthesizeTTS(text: string): Promise<Buffer | null> {
   if (!DEEPGRAM_API_KEY) {
