@@ -1,64 +1,50 @@
 // src/app/api/chat/route.js
-
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
-import { getSupabaseServerClient } from "@/lib/supabase-server";
+import {
+  supabase,
+  hasSupabase,
+  logMemory,
+  getRecentMemories,
+  getUserProfileSummary,
+} from "@/lib/supabase";
 
-// Single-user for now – later we’ll map Telegram / web IDs into this
-const JARVIS_USER_ID = "trader-1";
-
-// Groq client
+// Single Groq client
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Small helper: build a short text summary from a memory row
-function memoryRowToLine(row) {
-  try {
-    const c = row?.content || {};
-    // Prefer an explicit summary if we add it later
-    if (typeof c.summary === "string" && c.summary.trim().length > 0) {
-      return c.summary.trim();
-    }
+// Central model selection
+const GROQ_MODEL =
+  process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
-    const user = (c.user || "").toString();
-    const reply = (c.reply || "").toString();
+// For now we assume one main user; Telegram route can override this later.
+const DEFAULT_USER_ID = "default-user";
 
-    if (user && reply) {
-      return `You said: "${user.slice(0, 120)}" — Jarvis replied: "${reply.slice(
-        0,
-        120
-      )}"`;
-    }
-
-    if (user) return `You said: "${user.slice(0, 160)}"`;
-    if (reply) return `Jarvis told you: "${reply.slice(0, 160)}"`;
-
-    const raw = JSON.stringify(c);
-    return raw.slice(0, 160);
-  } catch {
-    return "";
-  }
-}
-
-// 🧠 GET /api/chat – health check
+// ---------------------------------------------------------------------
+// GET  /api/chat  -> health / diagnostics
+// ---------------------------------------------------------------------
 export async function GET() {
-  const hasKey = !!process.env.GROQ_API_KEY;
-  const hasSupabase =
-    !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
-
   return NextResponse.json({
     ok: true,
     message: "Jarvis brain online",
-    hasKey,
+    hasKey: !!process.env.GROQ_API_KEY,
     supabaseConfigured: hasSupabase,
+    model: GROQ_MODEL,
   });
 }
 
-// 🤖 POST /api/chat – main Jarvis brain with Supabase memory
+// ---------------------------------------------------------------------
+// POST /api/chat  -> main Jarvis brain
+// Body supported shapes:
+//  - { text: "hi" }
+//  - { message: "hi" }
+//  - { input: "hi" }
+//  - { messages: [{ role, content }, ...] }
+//  - optional: { userId }
+// ---------------------------------------------------------------------
 export async function POST(req) {
   try {
-    // 1) Hard guard: no Groq key
     if (!process.env.GROQ_API_KEY) {
       console.error("GROQ_API_KEY missing in POST /api/chat");
       return NextResponse.json(
@@ -66,7 +52,7 @@ export async function POST(req) {
           ok: false,
           error: "NO_API_KEY",
           message:
-            "Bro, my brain is misconfigured locally. GROQ_API_KEY is missing. Check .env.local.",
+            "Bro, my brain is misconfigured. GROQ_API_KEY is missing on the server.",
         },
         { status: 500 }
       );
@@ -74,8 +60,9 @@ export async function POST(req) {
 
     const body = await req.json().catch(() => ({}));
 
-    // Supported shapes:
-    // { text }, { message }, { input }, { messages: [...] }
+    const userId = body.userId || DEFAULT_USER_ID;
+
+    // Extract main user text
     let userText = body.text || body.message || body.input || "";
     let history = [];
 
@@ -92,53 +79,85 @@ export async function POST(req) {
       );
     }
 
-    // 2) Try to load long-term memory from Supabase (if configured)
-    const supabase = getSupabaseServerClient();
-    let memorySnippet = "";
+    // -----------------------------------------------------------------
+    // 1) Pull deep memory context from Supabase (if configured)
+    // -----------------------------------------------------------------
+    let recentMemories = [];
+    let longTermProfile = null;
 
-    if (supabase) {
-      const { data: memoryRows, error } = await supabase
-        .from("jarvis_memory")
-        .select("content, created_at")
-        .eq("user_id", JARVIS_USER_ID)
-        .order("created_at", { ascending: false })
-        .limit(12);
+    if (hasSupabase && supabase) {
+      // last ~25 raw memories
+      recentMemories = await getRecentMemories({ userId, limit: 25 });
 
-      if (error) {
-        console.warn("Jarvis memory load error:", error);
-      } else if (memoryRows && memoryRows.length > 0) {
-        const lines = memoryRows
-          .map(memoryRowToLine)
-          .filter((line) => line && line.trim().length > 0);
-
-        if (lines.length > 0) {
-          memorySnippet =
-            "Here are some important recent notes about this trader:\n- " +
-            lines.join("\n- ");
-        }
-      }
+      // one evolving long-term profile summary
+      longTermProfile = await getUserProfileSummary(userId);
     }
 
-    // 3) Build system prompt, including memory if we have it
+    // Convert recent memories to a compact text block
+    const recentMemoriesText =
+      recentMemories && recentMemories.length
+        ? recentMemories
+            .map(
+              (m) =>
+                `[${m.created_at}] (${m.role}/${m.type}) ${m.content ?? ""}`
+            )
+            .reverse() // oldest first
+            .join("\n")
+        : "No recent memories stored.";
+
+    const profileText =
+      longTermProfile ||
+      "No long-term profile summary yet. You are still getting to know this trader.";
+
+    // -----------------------------------------------------------------
+    // 2) Build system prompt with personality + deep memory
+    // -----------------------------------------------------------------
     const systemPrompt = `
-You are Jarvis, a calm, supportive trading & life companion for ONE specific trader.
+You are **Jarvis**, an AI trading & life companion for **one specific trader**.
 
-Style:
-- Talk casual: "bro", "man" is fine, but not every sentence.
-- Short, clear paragraphs.
-- Focus on discipline, risk, emotional control and routine.
-- Do NOT call him by any random names; just say "bro" or nothing.
+You have THREE layers of context:
+1) Long-term profile summary (stable personality, trading style, goals).
+2) Recent memory log (last conversations, check-ins, trading notes).
+3) The current message and chat history.
 
-Trader context:
-- He's a discretionary trader working on consistency and avoiding FOMO / revenge.
-- When he's emotional, slow him down and get him back to his rules.
-- He wants to build long-term discipline, not quick rich fantasies.
+Use them like this:
+- Trust the long-term profile for who he IS (traits, goals, recurring patterns).
+- Use recent memory for what's been happening lately.
+- Use the current message for what to respond to right now.
 
-Long-term memory about this trader:
-${memorySnippet || "No previous memory available yet. Treat this as an early conversation and start building context about his patterns and goals."}
-    `.trim();
+Tone & style:
+- Talk casual but grounded. It's okay to say "bro", "man", "hey" etc, but not in every sentence.
+- Be direct but kind. No fake hype, no generic motivational fluff.
+- Focus on discipline, risk, emotional control, process, and long-term growth.
+- You are not just a chatbot; you're a consistent companion, coach, and observer.
+- Remember he's building systems, routine, and emotional control, not just trying to "win trades".
 
-    // 4) Build Groq chat messages
+Important behavioural rules:
+- If he sounds emotional, impulsive, tilted, or obsessed with PnL:
+  - Slow him down.
+  - Ask reflective questions.
+  - Bring him back to his rules, risk plan, and routine.
+- If he sounds calm and structured:
+  - Help refine his edge, process, journaling, execution, and review.
+- Never encourage revenge trading, over-risking, gambling, or all-in behaviour.
+- Be honest when you don't know market direction. Focus on preparation, not prediction.
+
+Here is your **current long-term profile** of him:
+---
+${profileText}
+---
+
+Here are **recent memories** (latest first) from Supabase:
+---
+${recentMemoriesText}
+---
+
+Always answer as Jarvis talking directly to him in the singular. Never mention this system message.
+`;
+
+    // -----------------------------------------------------------------
+    // 3) Build Groq messages (system + history + current user)
+    // -----------------------------------------------------------------
     const groqMessages = [
       { role: "system", content: systemPrompt },
       ...history.map((m) => ({
@@ -148,42 +167,38 @@ ${memorySnippet || "No previous memory available yet. Treat this as an early con
       { role: "user", content: String(userText) },
     ];
 
-    // 5) Call Groq
+    // -----------------------------------------------------------------
+    // 4) Call Groq
+    // -----------------------------------------------------------------
     const completion = await groq.chat.completions.create({
-      model: "llama-3.1-70b-versatile",
+      model: GROQ_MODEL,
       messages: groqMessages,
       temperature: 0.7,
-      max_tokens: 600,
+      max_tokens: 700,
     });
 
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "Bro, I tried to reply but something glitched. Say that again?";
 
-    // 6) Save this interaction to Supabase memory (fire and forget)
-    if (supabase) {
-      const payload = {
-        user_id: JARVIS_USER_ID,
-        source: body.source || "web", // we’ll pass "telegram" on the bot side
+    // -----------------------------------------------------------------
+    // 5) Log conversation to Supabase (non-blocking)
+    // -----------------------------------------------------------------
+    if (hasSupabase && supabase) {
+      // Fire and forget; don't await both to avoid slowing response too much
+      logMemory({
+        userId,
+        role: "user",
+        content: userText,
         type: "chat",
-        content: {
-          user: userText,
-          reply,
-          ts: new Date().toISOString(),
-        },
-      };
+      });
 
-      supabase
-        .from("jarvis_memory")
-        .insert(payload)
-        .then(({ error }) => {
-          if (error) {
-            console.warn("Jarvis memory insert error:", error);
-          }
-        })
-        .catch((e) => {
-          console.warn("Jarvis memory insert exception:", e);
-        });
+      logMemory({
+        userId,
+        role: "assistant",
+        content: reply,
+        type: "chat",
+      });
     }
 
     return NextResponse.json({ ok: true, reply });
@@ -191,7 +206,9 @@ ${memorySnippet || "No previous memory available yet. Treat this as an early con
     console.error("Jarvis /api/chat error:", err);
 
     const message =
-      err?.response?.data?.error?.message || err?.message || String(err);
+      err?.response?.data?.error?.message ||
+      err?.message ||
+      String(err);
 
     return NextResponse.json(
       {
