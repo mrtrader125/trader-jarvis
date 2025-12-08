@@ -256,7 +256,17 @@ export async function POST(req: NextRequest) {
     }
 
     // --- 0.5) Percent-of-target questions: deterministic math only ---
-    if (isPercentOfTargetQuestion(userText)) {
+    const percentQuestionIntent =
+      !!userText &&
+      (
+        /\bhow (much|many)\b/i.test(userText) ||
+        /\bwhat(?:'s| is)? the? (percent|%)/i.test(userText) ||
+        /\bhow (far|close)\b.*\b(target|goal)\b/i.test(userText) ||
+        /\bpercent\b/i.test(userText) ||
+        userText.trim().endsWith("?")
+      );
+
+    if (percentQuestionIntent && isPercentOfTargetQuestion(userText)) {
       const reply = buildPercentOfTargetAnswerFromText(userText);
       if (reply) {
         await sendTelegramText(chatId, reply);
