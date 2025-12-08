@@ -60,7 +60,11 @@ function detectIntentTags(text: string | undefined): string[] {
     q.includes("revenge") ||
     q.includes("discipline") ||
     q.includes("tilt") ||
-    q.includes("mindset")
+    q.includes("mindset") ||
+    q.includes("worried") ||
+    q.includes("worry") ||
+    q.includes("stress") ||
+    q.includes("stressed")
   ) {
     tags.push("psychology");
   }
@@ -212,6 +216,16 @@ ${
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
+
+[Emotional Safety Rule]
+If the user expresses worry, fear, regret, stress, confusion, FOMO, or panic 
+(for example: "I'm worried", "I'm scared", "I'm stressed", "I have a running trade 😢", "I feel FOMO"),
+you MUST:
+1) Acknowledge the emotion first, in a warm, short way.
+2) Stabilize with a brief reassurance (for example: "breathe", "you're okay", "one trade doesn't define you").
+3) THEN ask at most ONE focused question or offer ONE simple next step.
+4) Avoid interrogating or judging their decision while they are clearly emotional.
+5) Once they are calmer, you can shift into discipline or trading analysis if relevant.
 
 You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
 
