@@ -11,6 +11,7 @@ import {
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
+import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
 
 export const runtime = "nodejs";
 
@@ -227,12 +228,19 @@ export async function POST(req: NextRequest) {
 
     // --- 0) Time questions (no LLM) ---
     if (isTimeQuestion(userText)) {
-      const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const replyRaw = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
 
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
       if (audio) await sendTelegramVoice(chatId, audio);
+
+      await saveHistoryPair({
+        supabase,
+        channel: "telegram",
+        userText,
+        assistantText: reply,
+      });
 
       return NextResponse.json({ ok: true });
     }
@@ -244,6 +252,14 @@ export async function POST(req: NextRequest) {
         await sendTelegramText(chatId, reply);
         const audio = await synthesizeTTS(reply);
         if (audio) await sendTelegramVoice(chatId, audio);
+
+        await saveHistoryPair({
+          supabase,
+          channel: "telegram",
+          userText,
+          assistantText: reply,
+        });
+
         return NextResponse.json({ ok: true });
       }
     }
@@ -285,10 +301,27 @@ ${
 - When summarizing or listing things about him, avoid "*" star bullets unless he asks; use numbered lists or simple dashes.
 `;
 
-    // --- 3) Build system prompt: profile + finance + time + knowledge + protocol ---
+    // --- 2.5) Load recent shared history (web + telegram) ---
+    const recentHistory = await loadRecentHistory({
+      supabase,
+      userId: "single-user",
+      limit: 10,
+    });
+
+    const historyMessages = recentHistory.map((h) => ({
+      role: h.role as "user" | "assistant",
+      content: h.content,
+    }));
+
+    // --- 3) Build system prompt ---
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
+
+[Identity]
+You are Jarvis, ONE single person – his long-term trading & life companion and assistant.
+You talk to him through two doors: the web app and Telegram, but you are always
+the same Jarvis with the same memory and personality.
 
 [Emotional Safety Rule]
 If the user expresses worry, fear, regret, stress, confusion, FOMO, or panic 
@@ -299,8 +332,6 @@ you MUST:
 3) THEN ask at most ONE focused question or offer ONE simple next step.
 4) Avoid interrogating or judging their decision while they are clearly emotional.
 5) Once they are calmer, you can shift into discipline or trading analysis if relevant.
-
-You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
 USER ID: "single-user"
 
@@ -321,7 +352,7 @@ Personality sliders (0–10):
 - Empathy: ${empathy}
 - Humor: ${humor}
 
-Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
+Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABOUT TIME):
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
@@ -410,6 +441,7 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: [
         { role: "system", content: systemPrompt },
+        ...historyMessages,
         { role: "user", content: userMessageForModel },
       ],
       stream: false,
@@ -424,6 +456,13 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
 
     const audio = await synthesizeTTS(replyText);
     if (audio) await sendTelegramVoice(chatId, audio);
+
+    await saveHistoryPair({
+      supabase,
+      channel: "telegram",
+      userText: userMessageForModel,
+      assistantText: replyText,
+    });
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
