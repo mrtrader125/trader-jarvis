@@ -1,4 +1,4 @@
-// src/app/api/chat/route.ts
+// trader-jarvis/src/app/api/chat/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
@@ -9,6 +9,7 @@ import {
   buildPercentOfTargetAnswerFromText,
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
+import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -28,6 +29,55 @@ function isTimeQuestion(text: string | undefined | null): boolean {
     q === "time?" ||
     q === "time"
   );
+}
+
+/**
+ * Very simple tag detector for the Knowledge Center.
+ * This decides which knowledge items are most relevant for this question.
+ */
+function detectIntentTags(text: string | undefined): string[] {
+  if (!text) return ["general"];
+  const q = text.toLowerCase();
+  const tags: string[] = [];
+
+  if (
+    q.includes("trade") ||
+    q.includes("trading") ||
+    q.includes("entry") ||
+    q.includes("stop loss") ||
+    q.includes("risk") ||
+    q.includes("prop firm") ||
+    q.includes("evaluation")
+  ) {
+    tags.push("trading");
+  }
+
+  if (
+    q.includes("psychology") ||
+    q.includes("emotion") ||
+    q.includes("fear") ||
+    q.includes("revenge") ||
+    q.includes("discipline") ||
+    q.includes("tilt") ||
+    q.includes("mindset")
+  ) {
+    tags.push("psychology");
+  }
+
+  if (
+    q.includes("money") ||
+    q.includes("salary") ||
+    q.includes("expenses") ||
+    q.includes("freedom") ||
+    q.includes("worry free") ||
+    q.includes("runway") ||
+    q.includes("minimum required")
+  ) {
+    tags.push("money", "freedom");
+  }
+
+  if (tags.length === 0) tags.push("general");
+  return tags;
 }
 
 export async function POST(req: NextRequest) {
@@ -99,7 +149,31 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    // --- 2) Build Jarvis system prompt with profile + finance + time ---
+    // --- 2) Build Knowledge Center context (your manual teachings) ---
+    const intentTags = detectIntentTags(lastUserContent);
+    const knowledgeBlocks = await buildKnowledgeContext({
+      intentTags,
+      maxItems: 8,
+    });
+
+    const knowledgeSection =
+      knowledgeBlocks.length === 0
+        ? "No explicit user knowledge has been defined yet."
+        : knowledgeBlocks
+            .map(
+              (b) => `
+### ${b.title} [${b.item_type}, importance ${b.importance}]
+${b.content}
+
+${
+  b.instructions
+    ? `How Jarvis must use this:\n${b.instructions}\n`
+    : ""
+}`
+            )
+            .join("\n");
+
+    // --- 3) Build Jarvis system prompt with profile + finance + time + knowledge ---
     const displayName = profile?.display_name || "Bro";
     const bio =
       profile?.bio ||
@@ -155,6 +229,12 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 
 ${financeSnippet}
 
+USER TEACHINGS (KNOWLEDGE CENTER):
+The user has manually defined the following rules, concepts, formulas, and stories.
+These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math.
+
+${knowledgeSection}
+
 CONVERSATION & LISTENING:
 
 1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
@@ -172,6 +252,48 @@ CONVERSATION & LISTENING:
    - For example, remind him that a calm monthly return close to his "safe monthly return percent"
      can already cover his living costs, so he doesn't need to gamble today.
    - Avoid generic speeches; stay tightly connected to his actual question and context.
+
+MATH & LISTENING PROTOCOL (STRICT):
+
+1) ALWAYS extract the key numbers the user gives:
+   - account size(s)
+   - profit/loss amounts
+   - target percentages
+   - evaluation rules (daily max loss, total max loss, target, etc.)
+
+2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
+   - If the user gives numbers or asks "how much", "how many", 
+     "what percent", "how far from target", ALWAYS answer with the 
+     raw calculation FIRST.
+   - Format answers like this:
+       • Result summary (1 line)
+       • Tiny breakdown (1–2 lines max)
+       • Then OPTIONAL coaching (1 line max)
+
+3) NEVER GUESS NUMBERS.
+   - If something is unclear, ask ONE clarifying question.
+   - DO NOT assume the initial capital if the user did not say it.
+
+4) WHEN THE USER PROVIDES A CORRECTION:
+   - Immediately apologize briefly.
+   - Restate the corrected numbers.
+   - Recalculate CORRECTLY.
+   - Provide the clean updated answer BEFORE ANY coaching.
+
+5) COACHING RULE:
+   - Coaching must always come AFTER the numeric answer.
+   - Coaching must be short (1–2 lines max).
+   - Coaching MUST relate directly to the user's numbers and goal.
+   - DO NOT give generic lectures.
+
+6) STRICT PRIORITY ORDER:
+   (1) Listen and extract numbers  
+   (2) Compute  
+   (3) Present result  
+   (4) Optional coaching  
+
+Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
+Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
 `.trim();
 
     const finalMessages = [
@@ -179,7 +301,7 @@ CONVERSATION & LISTENING:
       ...messagesWithTime,
     ];
 
-    // --- 3) Call Groq LLM for normal chat path ---
+    // --- 4) Call Groq LLM for normal chat path ---
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: finalMessages,
