@@ -12,6 +12,11 @@ import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
 import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
+import {
+  autoUpdateTradingMemoryFromUtterance,
+  loadTradingProfile,
+  buildTradingProfileSnippet,
+} from "@/lib/jarvis/tradingMemory";
 
 export const runtime = "nodejs";
 
@@ -181,6 +186,9 @@ export async function POST(req: NextRequest) {
 
     const supabase = createClient();
 
+    // Update trading memory from what you say
+    await autoUpdateTradingMemoryFromUtterance(supabase, userText);
+
     // --- Profile ---
     let profile: any = null;
     try {
@@ -225,6 +233,8 @@ export async function POST(req: NextRequest) {
     const humor = profile?.humor_level ?? 5;
 
     const financeSnippet = buildFinanceContextSnippet(finance);
+    const tradingProfile = await loadTradingProfile(supabase);
+    const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
     // --- 0) Time questions (no LLM) ---
     if (isTimeQuestion(userText)) {
@@ -366,6 +376,8 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABO
 
 ${financeSnippet}
 
+${tradingSnippet}
+
 USER TEACHINGS (KNOWLEDGE CENTER):
 The user has manually defined the following rules, concepts, formulas, and stories.
 These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math or the laws of reality.
@@ -389,7 +401,7 @@ CONVERSATION & LISTENING (TELEGRAM):
 
 4) Coaching style:
    - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
+   - Use the finance snapshot and trading memory when he talks about risk, capital, or feeling rushed.
    - Avoid generic speeches; stay tightly connected to his actual question and context.
 
 MATH & LISTENING PROTOCOL (STRICT):
@@ -432,7 +444,7 @@ MATH & LISTENING PROTOCOL (STRICT):
    (4) Optional coaching  
 
 Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
+Use the Knowledge Center rules and trading profile memory as the user's personal doctrine whenever relevant.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
