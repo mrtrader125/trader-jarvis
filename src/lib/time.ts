@@ -1,35 +1,41 @@
 // src/lib/time.ts
 
-export type NowInfo = {
-  iso: string;
-  timezone: string;
-  timeString: string;   // e.g. "1:57:12 am"
-  dateString: string;   // e.g. "8/12/2025"
-  localeString: string; // e.g. "8/12/2025, 1:57:12 am"
-};
-
-export function getNowInfo(timezone: string): NowInfo {
+export function getNowInfo(timezone: string) {
   const now = new Date();
 
-  const timeString = now.toLocaleTimeString("en-IN", {
+  const dateFormatter = new Intl.DateTimeFormat("en-IN", {
     timeZone: timezone,
-    hour12: true,
-    hour: "numeric",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const timeFormatter = new Intl.DateTimeFormat("en-IN", {
+    timeZone: timezone,
+    hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hour12: false,
   });
 
-  const dateString = now.toLocaleDateString("en-IN", {
-    timeZone: timezone,
-  });
+  const dateParts = dateFormatter.formatToParts(now);
+  const timeParts = timeFormatter.formatToParts(now);
 
-  const localeString = `${dateString}, ${timeString}`;
+  const dateString = dateParts
+    .map((p) => p.value)
+    .join(""); // something like 08/12/2025 depending on locale
+
+  const timeString = timeParts
+    .map((p) => p.value)
+    .join(""); // "13:05:23" etc.
+
+  const localeString = `${dateString} ${timeString}`;
 
   return {
     iso: now.toISOString(),
     timezone,
-    timeString,
-    dateString,
     localeString,
+    dateString,
+    timeString,
   };
 }
