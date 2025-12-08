@@ -300,4 +300,71 @@ export function buildPercentOfTargetAnswerFromText(
   text: string
 ): string | null {
   const numbers = text.match(/-?\d+(\.\d+)?/g);
-  if (!numbers || numbers.length < 2)
+  if (!numbers || numbers.length < 2) return null;
+
+  const a = parseFloat(numbers[0]);
+  const b = parseFloat(numbers[1]);
+
+  if (!isFinite(a) || !isFinite(b) || b === 0) return null;
+
+  // assume: a = current, b = target
+  const current = a;
+  const target = b;
+
+  const percent = (current / target) * 100;
+  const remaining = target - current;
+  const remainingPct = 100 - percent;
+
+  return [
+    `You've completed ~${percent.toFixed(2)}% of your target.`,
+    `Current: ${current}, Target: ${target}.`,
+    remaining >= 0
+      ? `You need ${remaining.toFixed(
+          2
+        )} more (${remainingPct.toFixed(2)}% of the target) to hit it.`
+      : `You've exceeded the target by ${Math.abs(remaining).toFixed(
+          2
+        )} (that's ${Math.abs(remainingPct).toFixed(2)}% over the target).`,
+  ].join(" ");
+}
+
+// Optional: a formatter if you ever need textual summary from a MathTask
+export function formatEvalAnswer(task: MathTask): string {
+  const result = runMathTask(task);
+
+  switch (result.type) {
+    case "position-size": {
+      const r = result.result;
+      return `Risking ${r.riskPercent}% = ${r.riskAmount.toFixed(
+        2
+      )} with a stop of ${r.stopLossPoints} points at ${r.valuePerPoint} per point → position size ~ ${r.positionSize.toFixed(
+        3
+      )}.`;
+    }
+    case "prop-firm-plan": {
+      const r = result.result;
+      return [
+        `Target: ${r.targetProfitPct}% (${r.targetProfitAmount.toFixed(
+          2
+        )}).`,
+        `Daily loss limit: ${r.dailyLossLimitPct}% (${r.dailyLossLimitAmount.toFixed(
+          2
+        )}).`,
+        `Total loss limit: ${r.totalLossLimitPct}% (${r.totalLossLimitAmount.toFixed(
+          2
+        )}).`,
+        `Safe risk per trade ≈ ${r.safeRiskPerTradePct.toFixed(2)}%.`,
+      ].join(" ");
+    }
+    case "compounding-plan": {
+      const r = result.result;
+      return `Starting from ${r.startingBalance}, after ${
+        r.numberOfTrades
+      } trades, expected balance ≈ ${r.endingBalance} (growth factor per trade ~ ${r.growthFactorPerTrade.toFixed(
+        4
+      )}).`;
+    }
+    default:
+      return "Unknown math result.";
+  }
+}
