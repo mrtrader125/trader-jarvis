@@ -144,7 +144,21 @@ export async function POST(req: NextRequest) {
     }
 
     // --- 0.5) "How much percent of target" questions: backend math only ---
-    if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
+    const percentQuestionIntent =
+      !!lastUserContent &&
+      (
+        /\bhow (much|many)\b/i.test(lastUserContent) ||
+        /\bwhat(?:'s| is)? the? (percent|%)/i.test(lastUserContent) ||
+        /\bhow (far|close)\b.*\b(target|goal)\b/i.test(lastUserContent) ||
+        /\bpercent\b/i.test(lastUserContent) ||
+        lastUserContent.trim().endsWith("?")
+      );
+
+    if (
+      lastUserContent &&
+      percentQuestionIntent &&
+      isPercentOfTargetQuestion(lastUserContent)
+    ) {
       const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
       if (answer) {
         await saveHistoryPair({
