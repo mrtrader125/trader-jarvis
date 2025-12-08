@@ -1,124 +1,303 @@
 // src/lib/jarvis/math.ts
 
-export type EvalContext = {
-  accountSize?: number;
-  targetPercent?: number;
-  targetMoney?: number;
-  currentProfit?: number;
-};
+// ---------- Types ----------
 
-function cleanNumber(str: string): number | undefined {
-  const cleaned = str.replace(/[^0-9.]/g, "");
-  if (!cleaned) return undefined;
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : undefined;
+export type Currency = string;
+
+export interface PositionSizeInput {
+  accountSize: number;      // e.g. 100000
+  riskPercent: number;      // e.g. 1 (for 1% risk)
+  stopLossPoints: number;   // pips / points
+  valuePerPoint: number;    // money per pip/point per 1 lot or unit
 }
 
-export function isPercentOfTargetQuestion(text: string | undefined | null): boolean {
-  if (!text) return false;
-  const q = text.toLowerCase();
-  return (
-    q.includes("percent of the target") ||
-    (q.includes("percent") && q.includes("target")) ||
-    (q.includes("%") && q.includes("target")) ||
-    q.includes("how much percent") ||
-    q.includes("how many percent")
+export interface PositionSizeResult {
+  riskAmount: number;
+  positionSize: number;
+  riskPercent: number;
+  stopLossPoints: number;
+  valuePerPoint: number;
+}
+
+export interface PropFirmConfig {
+  accountSize: number;
+  currency: Currency;
+  targetReturnPct: number;       // e.g. 8
+  maxDailyDrawdownPct: number;   // e.g. 5
+  maxTotalDrawdownPct: number;   // e.g. 10
+  minTradingDays?: number;
+  phase?: 1 | 2 | 3;
+}
+
+export interface PropFirmPlanInput {
+  config: PropFirmConfig;
+  riskPerTradePct: number;
+  expectedRR: number;
+  expectedWinratePct: number;
+  maxTradesPerDay: number;
+}
+
+export interface PropFirmPlanResult {
+  dailyLossLimitPct: number;
+  dailyLossLimitAmount: number;
+  totalLossLimitPct: number;
+  totalLossLimitAmount: number;
+  targetProfitPct: number;
+  targetProfitAmount: number;
+
+  maxRiskPerTradePctByDailyRule: number;
+  maxRiskPerTradePctByTotalRule: number;
+  safeRiskPerTradePct: number;
+
+  estimatedLosingStreak: number;
+  notes: string[];
+}
+
+export interface CompoundingPlanInput {
+  startingBalance: number;
+  riskPerTradePct: number;
+  expectedRR: number;
+  expectedWinratePct: number;
+  numberOfTrades: number;
+}
+
+export interface CompoundingStep {
+  tradeNumber: number;
+  balance: number;
+}
+
+export interface CompoundingPlanResult {
+  startingBalance: number;
+  endingBalance: number;
+  growthFactorPerTrade: number;
+  numberOfTrades: number;
+  steps: CompoundingStep[];
+}
+
+// ---- Unified Math Engine Types ----
+
+export type MathTask =
+  | { type: "position-size"; input: PositionSizeInput }
+  | { type: "prop-firm-plan"; input: PropFirmPlanInput }
+  | { type: "compounding-plan"; input: CompoundingPlanInput };
+
+export type MathTaskResult =
+  | { type: "position-size"; result: PositionSizeResult }
+  | { type: "prop-firm-plan"; result: PropFirmPlanResult }
+  | { type: "compounding-plan"; result: CompoundingPlanResult };
+
+// ---------- Core math functions ----------
+
+export function calculatePositionSize(
+  input: PositionSizeInput
+): PositionSizeResult {
+  const { accountSize, riskPercent, stopLossPoints, valuePerPoint } = input;
+
+  if (accountSize <= 0) throw new Error("Account size must be > 0");
+  if (riskPercent <= 0) throw new Error("Risk percent must be > 0");
+  if (stopLossPoints <= 0) throw new Error("Stop loss points must be > 0");
+  if (valuePerPoint <= 0) throw new Error("Value per point must be > 0");
+
+  const riskAmount = (accountSize * riskPercent) / 100;
+  const positionSize = riskAmount / (stopLossPoints * valuePerPoint);
+
+  return {
+    riskAmount,
+    positionSize,
+    riskPercent,
+    stopLossPoints,
+    valuePerPoint,
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function estimateLosingStreak(winratePct: number): number {
+  const winrate = clamp(winratePct / 100, 0.01, 0.99);
+  const lossProb = 1 - winrate;
+
+  // approx longest losing streak (95% tail, ~100 trades)
+  const losingStreak = Math.log(0.05) / Math.log(lossProb);
+  const rounded = Math.max(1, Math.round(losingStreak));
+  return rounded;
+}
+
+export function buildPropFirmPlan(
+  input: PropFirmPlanInput
+): PropFirmPlanResult {
+  const { config, riskPerTradePct, expectedRR, expectedWinratePct, maxTradesPerDay } =
+    input;
+  const {
+    accountSize,
+    currency,
+    targetReturnPct,
+    maxDailyDrawdownPct,
+    maxTotalDrawdownPct,
+  } = config;
+
+  if (accountSize <= 0) throw new Error("Account size must be > 0");
+  if (maxTradesPerDay <= 0) throw new Error("maxTradesPerDay must be > 0");
+
+  const dailyLossLimitAmount = (accountSize * maxDailyDrawdownPct) / 100;
+  const totalLossLimitAmount = (accountSize * maxTotalDrawdownPct) / 100;
+  const targetProfitAmount = (accountSize * targetReturnPct) / 100;
+
+  const estimatedLosingStreak = estimateLosingStreak(expectedWinratePct);
+
+  const maxRiskPerTradePctByDailyRule = maxDailyDrawdownPct / maxTradesPerDay;
+  const maxRiskPerTradePctByTotalRule =
+    maxTotalDrawdownPct / estimatedLosingStreak;
+
+  const safeRiskPerTradePct = Math.min(
+    maxRiskPerTradePctByDailyRule,
+    maxRiskPerTradePctByTotalRule,
+    riskPerTradePct
   );
+
+  const notes: string[] = [];
+
+  notes.push(`Account: ${accountSize.toFixed(2)} ${currency}`);
+  notes.push(
+    `Target profit: ${targetReturnPct}% → ${targetProfitAmount.toFixed(
+      2
+    )} ${currency}`
+  );
+  notes.push(
+    `Max daily drawdown: ${maxDailyDrawdownPct}% → ${dailyLossLimitAmount.toFixed(
+      2
+    )} ${currency}`
+  );
+  notes.push(
+    `Max total drawdown: ${maxTotalDrawdownPct}% → ${totalLossLimitAmount.toFixed(
+      2
+    )} ${currency}`
+  );
+  notes.push(
+    `Estimated worst losing streak (~100 trades, 95% tail): ~${estimatedLosingStreak} losses in a row`
+  );
+  notes.push(
+    `Max risk per trade by daily rule: ~${maxRiskPerTradePctByDailyRule.toFixed(
+      2
+    )}%`
+  );
+  notes.push(
+    `Max risk per trade by total rule: ~${maxRiskPerTradePctByTotalRule.toFixed(
+      2
+    )}%`
+  );
+  notes.push(
+    `Chosen safe risk per trade: ${safeRiskPerTradePct.toFixed(
+      2
+    )}% (input: ${riskPerTradePct}%)`
+  );
+  notes.push(
+    `Expected R:R = ${expectedRR}, expected winrate = ${expectedWinratePct}%`
+  );
+
+  return {
+    dailyLossLimitPct: maxDailyDrawdownPct,
+    dailyLossLimitAmount,
+    totalLossLimitPct: maxTotalDrawdownPct,
+    totalLossLimitAmount,
+    targetProfitPct: targetReturnPct,
+    targetProfitAmount,
+    maxRiskPerTradePctByDailyRule,
+    maxRiskPerTradePctByTotalRule,
+    safeRiskPerTradePct,
+    estimatedLosingStreak,
+    notes,
+  };
 }
 
-export function extractEvalContext(text: string): EvalContext | null {
-  const ctx: EvalContext = {};
+export function buildCompoundingPlan(
+  input: CompoundingPlanInput
+): CompoundingPlanResult {
+  const {
+    startingBalance,
+    riskPerTradePct,
+    expectedRR,
+    expectedWinratePct,
+    numberOfTrades,
+  } = input;
+
+  if (startingBalance <= 0) throw new Error("Starting balance must be > 0");
+  if (riskPerTradePct <= 0) throw new Error("Risk per trade percent must be > 0");
+  if (numberOfTrades <= 0) throw new Error("Number of trades must be > 0");
+
+  const winrate = expectedWinratePct / 100;
+  const lossRate = 1 - winrate;
+
+  const expectedR = winrate * expectedRR - lossRate * 1;
+  const riskFraction = riskPerTradePct / 100;
+  const growthFactorPerTrade = 1 + riskFraction * expectedR;
+
+  let balance = startingBalance;
+  const steps: CompoundingStep[] = [];
+
+  for (let i = 1; i <= numberOfTrades; i++) {
+    balance = balance * growthFactorPerTrade;
+    steps.push({
+      tradeNumber: i,
+      balance: Number(balance.toFixed(2)),
+    });
+  }
+
+  const endingBalance = Number(balance.toFixed(2));
+
+  return {
+    startingBalance,
+    endingBalance,
+    growthFactorPerTrade,
+    numberOfTrades,
+    steps,
+  };
+}
+
+// ---------- Dispatcher (this is what your API route wants) ----------
+
+export function runMathTask(task: MathTask): MathTaskResult {
+  switch (task.type) {
+    case "position-size": {
+      const result = calculatePositionSize(task.input);
+      return { type: "position-size", result };
+    }
+    case "prop-firm-plan": {
+      const result = buildPropFirmPlan(task.input);
+      return { type: "prop-firm-plan", result };
+    }
+    case "compounding-plan": {
+      const result = buildCompoundingPlan(task.input);
+      return { type: "compounding-plan", result };
+    }
+    default: {
+      const _never: never = task;
+      throw new Error("Unknown math task type");
+    }
+  }
+}
+
+// ---------- Percent-of-target helpers (used in chat & telegram routes) ----------
+
+// Detect if user is asking: "what percent of my target have I hit" style questions
+export function isPercentOfTargetQuestion(text: string): boolean {
   const lower = text.toLowerCase();
+  const hasPercentWord = lower.includes("percent") || lower.includes("%");
+  const hasTargetWord =
+    lower.includes("target") ||
+    lower.includes("eval") ||
+    lower.includes("evaluation") ||
+    lower.includes("challenge");
 
-  // Account size: "15000$ account", "15k account", etc.
-  let m =
-    lower.match(/(\d[\d,\.]*)\s*(?:\$|usd)?[^\n]{0,25}\b(account|challenge|funded)/i) ||
-    lower.match(/\b(account|challenge|funded)[^\n]{0,25}(\d[\d,\.]*)\s*(?:\$|usd)?/i);
-  if (m) {
-    const num = cleanNumber(m[1] || m[2]);
-    if (num) ctx.accountSize = num;
-  }
-
-  // Target percent: "target is 12%" / "12% target"
-  m =
-    lower.match(/target[^\n]{0,25}(\d+(?:\.\d+)?)\s*%/) ||
-    lower.match(/(\d+(?:\.\d+)?)\s*%[^\n]{0,25}target/);
-  if (m) {
-    const num = cleanNumber(m[1]);
-    if (num) ctx.targetPercent = num;
-  }
-
-  // Target money: "target ... 1800$" / "1800$ target"
-  m =
-    lower.match(/target[^\n]{0,25}(\d[\d,\.]*)\s*(?:\$|usd)/i) ||
-    lower.match(/(\d[\d,\.]*)\s*(?:\$|usd)[^\n]{0,25}target/i);
-  if (m) {
-    const num = cleanNumber(m[1]);
-    if (num) ctx.targetMoney = num;
-  }
-
-  // Current profit: "1200$ profit" / "profit 1200$"
-  m =
-    lower.match(/(\d[\d,\.]*)\s*(?:\$|usd)?[^\n]{0,25}\bprofit/i) ||
-    lower.match(/\bprofit[^\n]{0,25}(\d[\d,\.]*)\s*(?:\$|usd)?/i);
-  if (m) {
-    const num = cleanNumber(m[1]);
-    if (num) ctx.currentProfit = num;
-  }
-
-  if (
-    ctx.accountSize === undefined &&
-    ctx.targetPercent === undefined &&
-    ctx.targetMoney === undefined &&
-    ctx.currentProfit === undefined
-  ) {
-    return null;
-  }
-
-  // Derive targetMoney from accountSize * targetPercent if possible
-  if (!ctx.targetMoney && ctx.targetPercent && ctx.accountSize) {
-    ctx.targetMoney = (ctx.accountSize * ctx.targetPercent) / 100;
-  }
-
-  return ctx;
+  const numberMatches = text.match(/-?\d+(\.\d+)?/g) || [];
+  return hasPercentWord && hasTargetWord && numberMatches.length >= 2;
 }
 
-export function formatEvalAnswer(ctx: EvalContext): string | null {
-  const { accountSize, targetPercent, targetMoney, currentProfit } = ctx;
-
-  if (!targetMoney || !currentProfit) return null;
-
-  const pctDone = (currentProfit / targetMoney) * 100;
-  const remaining = targetMoney - currentProfit;
-  const pctDoneRounded = Math.round(pctDone * 10) / 10;
-  const remainingRounded = Math.round(remaining * 100) / 100;
-
-  let accountPctStr = "";
-  if (accountSize) {
-    const pctAcc = (currentProfit / accountSize) * 100;
-    const pctAccRounded = Math.round(pctAcc * 10) / 10;
-    accountPctStr = ` That's also about ${pctAccRounded}% on the ${accountSize.toLocaleString()}$ account.`;
-  }
-
-  const targetLine = targetPercent
-    ? `Target: ${targetPercent}% = ${targetMoney.toLocaleString()}$.`
-    : `Target: ${targetMoney.toLocaleString()}$.`;
-
-  return (
-    `From what you told me:\n` +
-    `Account: ${accountSize ? accountSize.toLocaleString() + "$" : "N/A"}, ${targetLine}\n` +
-    `Current profit: ${currentProfit.toLocaleString()}$.\n\n` +
-    `You've completed about ${pctDoneRounded}% of the target and need roughly ${remainingRounded.toLocaleString()}$ more to finish.${accountPctStr}\n\n` +
-    `Nice controlled progress, Bro — no need to force random trades just to chase the last bit.`
-  );
-}
-
-/**
- * Convenience helper: given raw text, try to parse and fully answer a
- * "how much percent of target" question. Returns null if it can't.
- */
-export function buildPercentOfTargetAnswerFromText(text: string): string | null {
-  const ctx = extractEvalContext(text);
-  if (!ctx) return null;
-  return formatEvalAnswer(ctx);
-}
+// Build a natural-language answer from a text containing two numbers
+// Example: "I made 4500 and target is 8000, what percent of target?"
+export function buildPercentOfTargetAnswerFromText(
+  text: string
+): string | null {
+  const numbers = text.match(/-?\d+(\.\d+)?/g);
+  if (!numbers || numbers.length < 2)
