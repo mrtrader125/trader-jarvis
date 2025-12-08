@@ -1,21 +1,59 @@
-// /lib/jarvis/knowledge/store.ts
-import { createClient } from "@/lib/supabase/server"; // adjust path to your helper
+// src/lib/jarvis/knowledge/store.ts
+
+import { createClient } from "@/lib/supabase/server";
 import {
   UpsertKnowledgeItemInput,
   KnowledgeItem,
   KnowledgeModule,
 } from "./types";
 
-async function getModuleBySlug(slug: string): Promise<KnowledgeModule | null> {
+/**
+ * Get a module by slug. If it doesn't exist, create it automatically.
+ * This way, any new moduleSlug used in training data "just works".
+ */
+async function getOrCreateModuleBySlug(slug: string): Promise<KnowledgeModule> {
   const supabase = createClient();
+
+  // 1) Try to find existing module
   const { data, error } = await supabase
     .from("jarvis_knowledge_modules")
     .select("*")
     .eq("slug", slug)
     .maybeSingle();
 
-  if (error) throw error;
-  return data as KnowledgeModule | null;
+  if (error) {
+    console.error("Error loading knowledge module:", error.message);
+    throw error;
+  }
+
+  if (data) {
+    return data as KnowledgeModule;
+  }
+
+  // 2) Auto-create module if not found
+  const prettyName =
+    slug
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/\b\w/g, (c) => c.toUpperCase()) || "Jarvis Module";
+
+  const { data: created, error: insertError } = await supabase
+    .from("jarvis_knowledge_modules")
+    .insert({
+      slug,
+      name: prettyName,
+      description: `Auto-created module for slug "${slug}".`,
+    })
+    .select("*")
+    .single();
+
+  if (insertError) {
+    console.error("Error creating knowledge module:", insertError.message);
+    throw insertError;
+  }
+
+  return created as KnowledgeModule;
 }
 
 export async function upsertKnowledgeItem(
@@ -26,10 +64,7 @@ export async function upsertKnowledgeItem(
   let module_id: string | null = null;
 
   if (input.moduleSlug) {
-    const module = await getModuleBySlug(input.moduleSlug);
-    if (!module) {
-      throw new Error(`Module with slug "${input.moduleSlug}" not found.`);
-    }
+    const module = await getOrCreateModuleBySlug(input.moduleSlug);
     module_id = module.id;
   }
 
