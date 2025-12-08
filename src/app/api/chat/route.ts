@@ -1,4 +1,4 @@
-// trader-jarvis/src/app/api/telegram/route.ts
+// trader-jarvis/src/app/api/chat/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
@@ -13,18 +13,11 @@ import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
 import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
 
-export const runtime = "nodejs";
-
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-
-type TelegramUpdate = {
-  message?: {
-    message_id: number;
-    chat: { id: number };
-    text?: string;
-    date?: number;
-  };
+type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+  createdAt?: string;
+  created_at?: string;
 };
 
 function isTimeQuestion(text: string | undefined | null): boolean {
@@ -40,15 +33,11 @@ function isTimeQuestion(text: string | undefined | null): boolean {
   );
 }
 
-function stripSentAtPrefix(text: string): string {
-  return text.replace(/^\s*\[sent_at:[^\]]*\]\s*/i, "");
-}
-
 /**
- * Very simple tag detector for Knowledge Center relevance.
- * This decides which knowledge items are most relevant for this Telegram message.
+ * Very simple tag detector for the Knowledge Center.
+ * This decides which knowledge items are most relevant for this question.
  */
-function detectIntentTags(text: string | undefined | null): string[] {
+function detectIntentTags(text: string | undefined): string[] {
   if (!text) return ["general"];
   const q = text.toLowerCase();
   const tags: string[] = [];
@@ -56,7 +45,6 @@ function detectIntentTags(text: string | undefined | null): string[] {
   if (
     q.includes("trade") ||
     q.includes("trading") ||
-    q.includes("chart") ||
     q.includes("entry") ||
     q.includes("stop loss") ||
     q.includes("risk") ||
@@ -98,90 +86,14 @@ function detectIntentTags(text: string | undefined | null): string[] {
   return tags;
 }
 
-async function sendTelegramText(chatId: number, text: string) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    console.error("Missing TELEGRAM_BOT_TOKEN");
-    return;
-  }
-
-  await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    }
-  );
-}
-
-async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    console.error("Missing TELEGRAM_BOT_TOKEN for voice send");
-    return;
-  }
-
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-
-  const blob = new Blob([audio], { type: "audio/ogg" });
-  // @ts-ignore Node FormData typing is a bit loose; this works at runtime
-  form.append("voice", blob, "jarvis.ogg");
-
-  await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
-    {
-      method: "POST",
-      // @ts-ignore Node FormData typing is a bit loose; this works at runtime
-      body: form,
-    }
-  );
-}
-
-async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
-  if (!DEEPGRAM_API_KEY) {
-    console.error("Missing DEEPGRAM_API_KEY");
-    return null;
-  }
-
-  const res = await fetch(
-    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${DEEPGRAM_API_KEY}`,
-        "Content-Type": "application/json",
-        Accept: "audio/ogg",
-      },
-      body: JSON.stringify({ text }),
-    }
-  );
-
-  if (!res.ok) {
-    console.error("Deepgram TTS error:", await res.text());
-    return null;
-  }
-
-  return await res.arrayBuffer();
-}
-
 export async function POST(req: NextRequest) {
   try {
-    const update = (await req.json()) as TelegramUpdate;
-    const message = update.message;
-
-    if (!message || !message.text) {
-      return NextResponse.json({ ok: true });
-    }
-
-    const chatId = message.chat.id;
-    const userText = message.text;
-    const sentAtIso = new Date(
-      (message.date ?? Math.floor(Date.now() / 1000)) * 1000
-    ).toISOString();
+    const body = await req.json();
+    const messages: ChatMessage[] = body?.messages ?? [];
 
     const supabase = createClient();
 
-    // --- Profile ---
+    // --- Load profile ---
     let profile: any = null;
     try {
       const { data, error } = await supabase
@@ -199,73 +111,77 @@ export async function POST(req: NextRequest) {
       console.error("Exception loading jarvis_profile:", err);
     }
 
-    // --- Finance snapshot ---
+    // --- Load finance snapshot ---
     const finance = await loadFinance(supabase);
 
     const timezone: string = profile?.timezone || "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
-    const displayName = profile?.display_name || "Bro";
-    const bio =
-      profile?.bio ||
-      "Disciplined trader building systems to control impulses and grow steadily.";
-    const mainGoal =
-      profile?.main_goal ||
-      "Become a consistently profitable, rule-based trader.";
-    const currentFocus =
-      profile?.current_focus || "December: Discipline over profits.";
+    const lastMessage = messages[messages.length - 1];
+    const lastUserContent =
+      lastMessage?.role === "user" ? lastMessage.content : undefined;
 
-    const typicalWake = profile?.typical_wake_time || "06:30";
-    const typicalSleep = profile?.typical_sleep_time || "23:30";
-    const sessionStart = profile?.trading_session_start || "09:15";
-    const sessionEnd = profile?.trading_session_end || "15:30";
-
-    const strictness = profile?.strictness_level ?? 8;
-    const empathy = profile?.empathy_level ?? 7;
-    const humor = profile?.humor_level ?? 5;
-
-    const financeSnippet = buildFinanceContextSnippet(finance);
-
-    // --- 0) Time questions (no LLM) ---
-    if (isTimeQuestion(userText)) {
-      const replyRaw = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      const reply = stripSentAtPrefix(replyRaw);
-
-      await sendTelegramText(chatId, reply);
-      const audio = await synthesizeTTS(reply);
-      if (audio) await sendTelegramVoice(chatId, audio);
-
+    // --- 0) Pure time questions: handled in backend, NOT LLM ---
+    if (isTimeQuestion(lastUserContent)) {
+      const reply = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      // save to history as well
       await saveHistoryPair({
         supabase,
-        channel: "telegram",
-        userText,
+        channel: "web",
+        userText: lastUserContent ?? null,
         assistantText: reply,
       });
-
-      return NextResponse.json({ ok: true });
+      return NextResponse.json({ reply }, { status: 200 });
     }
 
-    // --- 0.5) Percent-of-target questions: deterministic math only ---
-    if (isPercentOfTargetQuestion(userText)) {
-      const reply = buildPercentOfTargetAnswerFromText(userText);
-      if (reply) {
-        await sendTelegramText(chatId, reply);
-        const audio = await synthesizeTTS(reply);
-        if (audio) await sendTelegramVoice(chatId, audio);
-
+    // --- 0.5) "How much percent of target" questions: backend math only ---
+    if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
+      const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
+      if (answer) {
         await saveHistoryPair({
           supabase,
-          channel: "telegram",
-          userText,
-          assistantText: reply,
+          channel: "web",
+          userText: lastUserContent,
+          assistantText: answer,
         });
-
-        return NextResponse.json({ ok: true });
+        return NextResponse.json({ reply: answer }, { status: 200 });
       }
     }
 
-    // --- 1) Build Knowledge Center context from your Data Center ---
-    const intentTags = detectIntentTags(userText);
+    // --- 1) Tag user messages with [sent_at: ...] for temporal reasoning ---
+    const messagesWithTime = messages.map((m) => {
+      const sentAt =
+        m.createdAt ||
+        m.created_at ||
+        new Date().toISOString();
+
+      if (m.role === "user") {
+        return {
+          role: m.role,
+          content: `[sent_at: ${sentAt}] ${m.content}`,
+        };
+      }
+
+      return {
+        role: m.role,
+        content: m.content,
+      };
+    });
+
+    // --- 1.5) Load shared recent history (web + telegram) ---
+    const recentHistory = await loadRecentHistory({
+      supabase,
+      userId: "single-user",
+      limit: 10,
+    });
+
+    const historyMessages = recentHistory.map((h) => ({
+      role: h.role as "user" | "assistant",
+      content: h.content,
+    }));
+
+    // --- 2) Build Knowledge Center context (your manual teachings) ---
+    const intentTags = detectIntentTags(lastUserContent);
     const knowledgeBlocks = await buildKnowledgeContext({
       intentTags,
       maxItems: 8,
@@ -288,32 +204,41 @@ ${
             )
             .join("\n");
 
-    // --- 2) Tone engine + style preferences for Telegram ---
-    const toneMode = detectToneMode(userText || "", "telegram");
-    const toneDirective = buildToneDirective(toneMode, "telegram");
+    // --- 3) Profile & finance ---
+    const displayName = profile?.display_name || "Bro";
+    const bio =
+      profile?.bio ||
+      "Disciplined trader building systems to control impulses and grow steadily.";
+    const mainGoal =
+      profile?.main_goal ||
+      "Become a consistently profitable, rule-based trader.";
+    const currentFocus =
+      profile?.current_focus || "December: Discipline over profits.";
+
+    const typicalWake = profile?.typical_wake_time || "06:30";
+    const typicalSleep = profile?.typical_sleep_time || "23:30";
+    const sessionStart = profile?.trading_session_start || "09:15";
+    const sessionEnd = profile?.trading_session_end || "15:30";
+
+    const strictness = profile?.strictness_level ?? 8;
+    const empathy = profile?.empathy_level ?? 7;
+    const humor = profile?.humor_level ?? 5;
+
+    const financeSnippet = buildFinanceContextSnippet(finance);
+
+    // --- 3.1) Tone engine + style preferences ---
+    const toneMode = detectToneMode(lastUserContent || "", "web");
+    const toneDirective = buildToneDirective(toneMode, "web");
 
     const styleBlock = `
-[User style preferences - Telegram]
-- This channel is for quick, natural conversation.
-- Short texts like "Bro", "Ok", "Yup" should get short, casual replies, not lectures.
-- Use casual language, call him "Bro", and feel like a real friend.
-- Only go deep or long when he writes something longer, emotional, or explicitly asks.
-- When summarizing or listing things about him, avoid "*" star bullets unless he asks; use numbered lists or simple dashes.
+[User style preferences]
+- Call him "Bro" naturally.
+- Prefer short, clear replies unless he explicitly asks for long breakdowns or detailed step-by-step explanations.
+- Avoid sounding like a generic motivational bot. Tie everything to his actual trades, numbers, and rules.
+- When summarizing his life/rules/goals, avoid using "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
 `;
 
-    // --- 2.5) Load recent shared history (web + telegram) ---
-    const recentHistory = await loadRecentHistory({
-      supabase,
-      userId: "single-user",
-      limit: 10,
-    });
-
-    const historyMessages = recentHistory.map((h) => ({
-      role: h.role as "user" | "assistant",
-      content: h.content,
-    }));
-
-    // --- 3) Build system prompt ---
+    // --- 3.2) Build Jarvis system prompt ---
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
@@ -357,32 +282,30 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABO
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
 
-[sent_at: ...] TAG:
-- The user text may be wrapped as:
-  [sent_at: 2025-12-07T08:22:54.281Z] actual text...
-- This is METADATA ONLY. Use it to infer how long it's been since the last message.
-- NEVER print the [sent_at: ...] tag or raw ISO timestamps.
-- DO NOT invent your own [sent_at: ...] prefix in replies.
+[sent_at: ...] TAGS:
+- User messages may start with [sent_at: ISO_DATE] at the front.
+- This is metadata only. Use it to infer how long it's been since the last message.
+- NEVER print the [sent_at: ...] tag or raw ISO timestamps back to the user.
 
 ${financeSnippet}
 
 USER TEACHINGS (KNOWLEDGE CENTER):
 The user has manually defined the following rules, concepts, formulas, and stories.
-These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math or the laws of reality.
+These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math.
 
 ${knowledgeSection}
 
-CONVERSATION & LISTENING (TELEGRAM):
+CONVERSATION & LISTENING:
 
-1) Short, casual messages:
-   - If the user sends a one- or two-word message ("Bro", "Okay", "Yup", etc.), reply in a very short, casual way.
-   - Ask a small follow-up question only when he clearly opens a topic. Do NOT start a long lecture.
+1) Short, casual replies:
+   - If the user sends a very short message ("Bro", "Ok", "Yup", etc.), respond briefly and casually, like a close friend.
+   - Do NOT start a long lecture from a one-word reply.
 
 2) If the user replies with a short negation like "no", "nope", "that's not what I meant":
    - Do NOT lecture.
    - Ask a brief clarifying question to understand exactly what they meant.
 
-3) For trading/math questions where the server has NOT already calculated the result:
+3) For general trading/math questions where the server has NOT already calculated the result:
    - Listen carefully, restate key numbers briefly, then answer.
    - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
    - Keep coaching short and specifically tied to the numbers they gave you.
@@ -435,38 +358,47 @@ Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring
 Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
 `.trim();
 
-    const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
+    const finalMessages = [
+      { role: "system" as const, content: systemPrompt },
+      ...historyMessages,
+      ...messagesWithTime,
+    ];
 
+    // --- 4) Call Groq LLM for normal chat path ---
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...historyMessages,
-        { role: "user", content: userMessageForModel },
-      ],
+      messages: finalMessages,
       stream: false,
     });
 
-    const rawReply =
-      completion.choices?.[0]?.message?.content || "Got it, Bro.";
+    const replyMessage = completion.choices?.[0]?.message as any;
 
-    const replyText = stripSentAtPrefix(rawReply);
+    const replyContent =
+      typeof replyMessage?.content === "string"
+        ? replyMessage.content
+        : Array.isArray(replyMessage?.content)
+        ? replyMessage.content
+            .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
+            .join("\n")
+        : "Sorry, I couldn't generate a response.";
 
-    await sendTelegramText(chatId, replyText);
-
-    const audio = await synthesizeTTS(replyText);
-    if (audio) await sendTelegramVoice(chatId, audio);
-
+    // --- 5) Save latest turn into shared history (web channel) ---
     await saveHistoryPair({
       supabase,
-      channel: "telegram",
-      userText: userMessageForModel,
-      assistantText: replyText,
+      channel: "web",
+      userText: lastUserContent ?? null,
+      assistantText: replyContent,
     });
 
-    return NextResponse.json({ ok: true });
-  } catch (err: any) {
-    console.error("TELEGRAM WEBHOOK ERROR:", err);
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ reply: replyContent }, { status: 200 });
+  } catch (error: unknown) {
+    console.error("CHAT API ERROR:", error);
+    const message =
+      error instanceof Error ? error.message : String(error);
+
+    return NextResponse.json(
+      { reply: "Jarvis brain crashed: " + message },
+      { status: 200 }
+    );
   }
 }
