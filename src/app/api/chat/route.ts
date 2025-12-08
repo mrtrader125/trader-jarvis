@@ -11,6 +11,7 @@ import {
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
+import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -122,7 +123,14 @@ export async function POST(req: NextRequest) {
 
     // --- 0) Pure time questions: handled in backend, NOT LLM ---
     if (isTimeQuestion(lastUserContent)) {
-      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const reply = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      // save to history as well
+      await saveHistoryPair({
+        supabase,
+        channel: "web",
+        userText: lastUserContent ?? null,
+        assistantText: reply,
+      });
       return NextResponse.json({ reply }, { status: 200 });
     }
 
@@ -130,6 +138,12 @@ export async function POST(req: NextRequest) {
     if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
       const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
       if (answer) {
+        await saveHistoryPair({
+          supabase,
+          channel: "web",
+          userText: lastUserContent,
+          assistantText: answer,
+        });
         return NextResponse.json({ reply: answer }, { status: 200 });
       }
     }
@@ -153,6 +167,18 @@ export async function POST(req: NextRequest) {
         content: m.content,
       };
     });
+
+    // --- 1.5) Load shared recent history (web + telegram) ---
+    const recentHistory = await loadRecentHistory({
+      supabase,
+      userId: "single-user",
+      limit: 10,
+    });
+
+    const historyMessages = recentHistory.map((h) => ({
+      role: h.role as "user" | "assistant",
+      content: h.content,
+    }));
 
     // --- 2) Build Knowledge Center context (your manual teachings) ---
     const intentTags = detectIntentTags(lastUserContent);
@@ -212,10 +238,15 @@ ${
 - When summarizing his life/rules/goals, avoid using "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
 `;
 
-    // --- 3.2) Build Jarvis system prompt with tone + profile + finance + time + knowledge ---
+    // --- 3.2) Build Jarvis system prompt ---
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
+
+[Identity]
+You are Jarvis, ONE single person – his long-term trading & life companion and assistant.
+You talk to him through two doors: the web app and Telegram, but you are always
+the same Jarvis with the same memory and personality.
 
 [Emotional Safety Rule]
 If the user expresses worry, fear, regret, stress, confusion, FOMO, or panic 
@@ -226,8 +257,6 @@ you MUST:
 3) THEN ask at most ONE focused question or offer ONE simple next step.
 4) Avoid interrogating or judging their decision while they are clearly emotional.
 5) Once they are calmer, you can shift into discipline or trading analysis if relevant.
-
-You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
 
 USER ID: "single-user"
 
@@ -248,7 +277,7 @@ Personality sliders (0–10):
 - Empathy: ${empathy}
 - Humor: ${humor}
 
-Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
+Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABOUT TIME):
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
@@ -331,6 +360,7 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
 
     const finalMessages = [
       { role: "system" as const, content: systemPrompt },
+      ...historyMessages,
       ...messagesWithTime,
     ];
 
@@ -351,6 +381,14 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
             .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
             .join("\n")
         : "Sorry, I couldn't generate a response.";
+
+    // --- 5) Save latest turn into shared history (web channel) ---
+    await saveHistoryPair({
+      supabase,
+      channel: "web",
+      userText: lastUserContent ?? null,
+      assistantText: replyContent,
+    });
 
     return NextResponse.json({ reply: replyContent }, { status: 200 });
   } catch (error: unknown) {
