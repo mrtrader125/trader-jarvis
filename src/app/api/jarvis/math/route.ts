@@ -1,6 +1,12 @@
-// /app/api/jarvis/math/route.ts
+// src/app/api/jarvis/math/route.ts
+// Simple HTTP wrapper around the deterministic math engine.
+
 import { NextRequest, NextResponse } from "next/server";
-import { MathTask, MathTaskResult, runMathTask } from "@/lib/jarvis/math";
+import {
+  MathTask,
+  MathTaskResult,
+  runMathTask,
+} from "@/lib/jarvis/math";
 
 export async function POST(req: NextRequest) {
   try {
@@ -9,13 +15,15 @@ export async function POST(req: NextRequest) {
 
     const result: MathTaskResult = runMathTask(task);
 
-    return NextResponse.json({
-      ok: true,
-      result,
-    });
+    return NextResponse.json(
+      {
+        ok: true,
+        result,
+      },
+      { status: 200 }
+    );
   } catch (error: any) {
     console.error("[/api/jarvis/math] error:", error);
-
     return NextResponse.json(
       {
         ok: false,
