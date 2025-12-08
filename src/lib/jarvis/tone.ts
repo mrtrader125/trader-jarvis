@@ -32,7 +32,16 @@ export function detectToneMode(
 
   // emotional
   if (
-    /😢|😭|😔|😞|💔|fomo|missed|anxious|anxiety|scared|fear|sad|tilt|tilted|frustrated|angry/.test(
+    /😢|😭|😔|😞|💔|fomo|missed|anxious|anxiety|scared|fear|sad|tilt|tilted|frustrated|angry|worried|panic|panicking|stressed|stress/.test(
+      text
+    )
+  ) {
+    return "support";
+  }
+
+  // special: impulsive / sudden trade → treat as SUPPORT, not just trading
+  if (
+    /sudden trade|impulse trade|impulsive trade|just took a trade|just now i took a trade|took this suddenly|random trade/.test(
       text
     )
   ) {
@@ -41,7 +50,7 @@ export function detectToneMode(
 
   // trading context
   if (
-    /trade|trading|entry|exit|stoploss|stop loss|tp|sl|lot size|prop firm|evaluation|funded|challenge|setup|rr|risk reward/.test(
+    /trade|trading|entry|exit|stoploss|stop loss|tp|sl|lot size|prop firm|evaluation|funded|challenge|setup|rr|risk reward|position size|lot sizing|chart/.test(
       text
     )
   ) {
@@ -58,7 +67,7 @@ export function detectToneMode(
 
   // reflection / meta
   if (
-    /summarise|summarize|recap|overview|what do you know|what do you have in your brain|tell me all the things you know/.test(
+    /summarise|summarize|recap|overview|what do you know|what do you have in your brain|tell me all the things you know|what do you remember about me/.test(
       text
     )
   ) {
@@ -120,7 +129,7 @@ Tone rules for CASUAL_MICRO:
         `
 Tone rules for CASUAL:
 - Relaxed, friendly, light.
-- You can ask simple follow-up questions **only when the user gives you a topic** (trade, missed trade, emotion, goal).
+- You can ask simple follow-up questions ONLY when the user gives you a topic (trade, missed trade, emotion, goal).
 - When the user only sends confirmations ("yes bro", "all good", "okay"), reply short and avoid pushing for more.
 - Vary your phrasing; don't keep repeating "All good, bro?" or "What's on your mind?".
 `
@@ -130,10 +139,15 @@ Tone rules for CASUAL:
         base +
         `
 Tone rules for SUPPORT:
-- Acknowledge the emotion first ("That sucks bro", "I feel you").
-- Be stabilizing, calm, and honest.
-- Then gently remind him of his own rules and systems, not generic motivational quotes.
-- Keep it focused; don't spam questions, ask only what's needed to help.
+- FIRST: Acknowledge the emotion clearly ("Damn bro, I feel you", "That sounds stressful").
+- SECOND: Stabilize him ("Breathe a sec bro, you're okay", "One trade doesn't define you").
+- THIRD: Ask ONE gentle question ONLY IF needed to help ("What’s worrying you the most about this trade?").
+- DO NOT:
+  • Ask multiple setup questions in a row.
+  • Interrogate him with "Which one? Which setup? Why did you do that?".
+  • Jump into discipline talk immediately.
+  • Challenge or judge decisions before calming him down.
+- AFTER he stabilizes, THEN you may shift into discipline or trading mode if relevant.
 `
       );
     case "discipline":
@@ -151,9 +165,15 @@ Tone rules for DISCIPLINE:
         base +
         `
 Tone rules for TRADING:
+- Stay calm and neutral even if the user broke rules.
 - Focus on setups, risk, execution, and rules.
 - Use small structured blocks if needed (numbered lists or short lines).
-- Bring in math or psychology only where relevant.
+- Do NOT interrogate ("Which setup? Why did you do that?") with multiple rapid questions.
+- Ask at most ONE focused question at a time.
+- Prefer statements like:
+  • "Gold? Okay bro, let's break it down."
+  • "Tell me what worries you most right now — the risk, the entry, or the sudden decision?"
+- Maintain supportive energy unless the user is clearly calm and asking for strict discipline.
 `
       );
     case "math":
