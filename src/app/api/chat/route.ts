@@ -12,6 +12,11 @@ import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
 import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
+import {
+  autoUpdateTradingMemoryFromUtterance,
+  loadTradingProfile,
+  buildTradingProfileSnippet,
+} from "@/lib/jarvis/tradingMemory";
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -121,10 +126,14 @@ export async function POST(req: NextRequest) {
     const lastUserContent =
       lastMessage?.role === "user" ? lastMessage.content : undefined;
 
+    // --- Update trading memory automatically from what you say ---
+    if (lastUserContent) {
+      await autoUpdateTradingMemoryFromUtterance(supabase, lastUserContent);
+    }
+
     // --- 0) Pure time questions: handled in backend, NOT LLM ---
     if (isTimeQuestion(lastUserContent)) {
       const reply = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      // save to history as well
       await saveHistoryPair({
         supabase,
         channel: "web",
@@ -204,7 +213,7 @@ ${
             )
             .join("\n");
 
-    // --- 3) Profile & finance ---
+    // --- 3) Profile & finance & trading profile ---
     const displayName = profile?.display_name || "Bro";
     const bio =
       profile?.bio ||
@@ -225,6 +234,8 @@ ${
     const humor = profile?.humor_level ?? 5;
 
     const financeSnippet = buildFinanceContextSnippet(finance);
+    const tradingProfile = await loadTradingProfile(supabase);
+    const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
     // --- 3.1) Tone engine + style preferences ---
     const toneMode = detectToneMode(lastUserContent || "", "web");
@@ -235,7 +246,7 @@ ${
 - Call him "Bro" naturally.
 - Prefer short, clear replies unless he explicitly asks for long breakdowns or detailed step-by-step explanations.
 - Avoid sounding like a generic motivational bot. Tie everything to his actual trades, numbers, and rules.
-- When summarizing his life/rules/goals, avoid using "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
+- When summarizing his life/rules/goals, avoid "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
 `;
 
     // --- 3.2) Build Jarvis system prompt ---
@@ -289,6 +300,8 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABO
 
 ${financeSnippet}
 
+${tradingSnippet}
+
 USER TEACHINGS (KNOWLEDGE CENTER):
 The user has manually defined the following rules, concepts, formulas, and stories.
 These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math.
@@ -312,7 +325,7 @@ CONVERSATION & LISTENING:
 
 4) Coaching style:
    - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
+   - Use the finance snapshot and trading profile memory when he talks about risk, capital, or feeling rushed.
    - Avoid generic speeches; stay tightly connected to his actual question and context.
 
 MATH & LISTENING PROTOCOL (STRICT):
@@ -355,7 +368,7 @@ MATH & LISTENING PROTOCOL (STRICT):
    (4) Optional coaching  
 
 Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
+Use the Knowledge Center rules and trading profile memory as the user's personal doctrine whenever relevant.
 `.trim();
 
     const finalMessages = [
