@@ -1,4 +1,4 @@
-// src/app/api/telegram/route.ts
+// trader-jarvis/src/app/api/telegram/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
@@ -9,6 +9,7 @@ import {
   buildPercentOfTargetAnswerFromText,
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
+import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 
 export const runtime = "nodejs";
 
@@ -39,6 +40,56 @@ function isTimeQuestion(text: string | undefined | null): boolean {
 
 function stripSentAtPrefix(text: string): string {
   return text.replace(/^\s*\[sent_at:[^\]]*\]\s*/i, "");
+}
+
+/**
+ * Very simple tag detector for Knowledge Center relevance.
+ * This decides which knowledge items are most relevant for this Telegram message.
+ */
+function detectIntentTags(text: string | undefined | null): string[] {
+  if (!text) return ["general"];
+  const q = text.toLowerCase();
+  const tags: string[] = [];
+
+  if (
+    q.includes("trade") ||
+    q.includes("trading") ||
+    q.includes("chart") ||
+    q.includes("entry") ||
+    q.includes("stop loss") ||
+    q.includes("risk") ||
+    q.includes("prop firm") ||
+    q.includes("evaluation")
+  ) {
+    tags.push("trading");
+  }
+
+  if (
+    q.includes("psychology") ||
+    q.includes("emotion") ||
+    q.includes("fear") ||
+    q.includes("revenge") ||
+    q.includes("discipline") ||
+    q.includes("tilt") ||
+    q.includes("mindset")
+  ) {
+    tags.push("psychology");
+  }
+
+  if (
+    q.includes("money") ||
+    q.includes("salary") ||
+    q.includes("expenses") ||
+    q.includes("freedom") ||
+    q.includes("worry free") ||
+    q.includes("runway") ||
+    q.includes("minimum required")
+  ) {
+    tags.push("money", "freedom");
+  }
+
+  if (tags.length === 0) tags.push("general");
+  return tags;
 }
 
 async function sendTelegramText(chatId: number, text: string) {
@@ -142,7 +193,7 @@ export async function POST(req: NextRequest) {
       console.error("Exception loading jarvis_profile:", err);
     }
 
-    // --- Finance ---
+    // --- Finance snapshot ---
     const finance = await loadFinance(supabase);
 
     const timezone: string = profile?.timezone || "Asia/Kolkata";
@@ -169,7 +220,7 @@ export async function POST(req: NextRequest) {
 
     const financeSnippet = buildFinanceContextSnippet(finance);
 
-    // --- 0) Time questions ---
+    // --- 0) Time questions (no LLM) ---
     if (isTimeQuestion(userText)) {
       const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
@@ -181,7 +232,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // --- 0.5) Percent-of-target questions: Node math only ---
+    // --- 0.5) Percent-of-target questions: deterministic math only ---
     if (isPercentOfTargetQuestion(userText)) {
       const reply = buildPercentOfTargetAnswerFromText(userText);
       if (reply) {
@@ -192,14 +243,38 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // --- 1) Build system prompt for LLM path ---
+    // --- 1) Build Knowledge Center context from your Data Center ---
+    const intentTags = detectIntentTags(userText);
+    const knowledgeBlocks = await buildKnowledgeContext({
+      intentTags,
+      maxItems: 8,
+    });
+
+    const knowledgeSection =
+      knowledgeBlocks.length === 0
+        ? "No explicit user knowledge has been defined yet."
+        : knowledgeBlocks
+            .map(
+              (b) => `
+### ${b.title} [${b.item_type}, importance ${b.importance}]
+${b.content}
+
+${
+  b.instructions
+    ? `How Jarvis must use this:\n${b.instructions}\n`
+    : ""
+}`
+            )
+            .join("\n");
+
+    // --- 2) Build system prompt: profile + finance + time + knowledge + protocol ---
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
 USER ID: "single-user"
 
 User identity:
-- Name: ${displayName}
+- Name you call him: ${displayName}
 - Bio: ${bio}
 - Main goal: ${mainGoal}
 - Current focus: ${currentFocus}
@@ -229,21 +304,71 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 
 ${financeSnippet}
 
+USER TEACHINGS (KNOWLEDGE CENTER):
+The user has manually defined the following rules, concepts, formulas, and stories.
+These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math or the laws of reality.
+
+${knowledgeSection}
+
 CONVERSATION & LISTENING (TELEGRAM):
 
 1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
    - Do NOT lecture.
-   - Ask a brief clarifying question to understand what they actually want.
+   - Ask a brief clarifying question to understand exactly what they meant.
 
-2) For math questions that the server hasn't already answered:
-   - Listen to the numbers carefully, restate them briefly, then answer.
-   - If the user says you're wrong, apologize briefly, restate their numbers, and recompute carefully.
-   - Keep coaching short and specific.
+2) For trading/math questions where the server has NOT already calculated the result:
+   - Listen carefully, restate key numbers briefly, then answer.
+   - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
+   - Keep coaching short and specifically tied to the numbers they gave you.
 
 3) Coaching style:
-   - Be firm about discipline over random trades, especially with high strictness.
-   - Use the finance snapshot to show when calm returns are enough to meet his monthly needs.
-   - Only say "you lost discipline" when he clearly breaks his own rules, not when he's just asking questions or correcting you.
+   - Strict but caring. Discipline over random trades.
+   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
+   - For example, remind him that a calm monthly return close to his "safe monthly return percent"
+     can already cover his living costs, so he doesn't need to gamble today.
+   - Avoid generic speeches; stay tightly connected to his actual question and context.
+
+MATH & LISTENING PROTOCOL (STRICT):
+
+1) ALWAYS extract the key numbers the user gives:
+   - account size(s)
+   - profit/loss amounts
+   - target percentages
+   - evaluation rules (daily max loss, total max loss, target, etc.)
+
+2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
+   - If the user gives numbers or asks "how much", "how many", 
+     "what percent", "how far from target", ALWAYS answer with the 
+     raw calculation FIRST.
+   - Format answers like this:
+       • Result summary (1 line)
+       • Tiny breakdown (1–2 lines max)
+       • Then OPTIONAL coaching (1 line max)
+
+3) NEVER GUESS NUMBERS.
+   - If something is unclear, ask ONE clarifying question.
+   - DO NOT assume the initial capital if the user did not say it.
+
+4) WHEN THE USER PROVIDES A CORRECTION:
+   - Immediately apologize briefly.
+   - Restate the corrected numbers.
+   - Recalculate CORRECTLY.
+   - Provide the clean updated answer BEFORE ANY coaching.
+
+5) COACHING RULE:
+   - Coaching must always come AFTER the numeric answer.
+   - Coaching must be short (1–2 lines max).
+   - Coaching MUST relate directly to the user's numbers and goal.
+   - DO NOT give generic lectures.
+
+6) STRICT PRIORITY ORDER:
+   (1) Listen and extract numbers  
+   (2) Compute  
+   (3) Present result  
+   (4) Optional coaching  
+
+Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
+Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
