@@ -177,6 +177,6 @@ Tone rules for DEFAULT:
 - Balanced: friendly but not over-casual, structured but not stiff.
 - If the next user message looks emotional or about trading/math, smoothly shift into SUPPORT, TRADING, or MATH style.
 `
-      );
+       );
   }
 }
