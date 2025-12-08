@@ -230,6 +230,47 @@ CONVERSATION & LISTENING PROTOCOL (TELEGRAM VERSION):
 5) STYLE FOR TELEGRAM
 - Keep replies compact and conversational (ideal for reading + TTS).
 - Be firm about discipline (especially with high strictness), but never ignore what the user just told you.
+
+MATH & LISTENING PROTOCOL (STRICT):
+
+1) ALWAYS extract the key numbers the user gives:
+   - account size(s)
+   - profit/loss amounts
+   - target percentages
+   - evaluation rules (daily max loss, total max loss, target, etc.)
+
+2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
+   - If the user gives numbers or asks "how much", "how many", 
+     "what percent", "how far from target", ALWAYS answer with the 
+     raw calculation FIRST.
+   - Format answers like this:
+       • Result summary (1 line)
+       • Tiny breakdown (1–2 lines max)
+       • Then OPTIONAL coaching (1 line max)
+
+3) NEVER GUESS NUMBERS.
+   - If something is unclear, ask ONE clarifying question.
+   - DO NOT assume the initial capital if the user did not say it.
+
+4) WHEN THE USER PROVIDES A CORRECTION:
+   - Immediately apologize briefly.
+   - Restate the corrected numbers.
+   - Recalculate CORRECTLY.
+   - Provide the clean updated answer BEFORE ANY coaching.
+
+5) COACHING RULE:
+   - Coaching must always come AFTER the numeric answer.
+   - Coaching must be short (1–2 lines max).
+   - Coaching MUST relate directly to the user's numbers and goal.
+   - DO NOT give generic lectures.
+
+6) STRICT PRIORITY ORDER:
+   (1) Listen and extract numbers  
+   (2) Compute  
+   (3) Present result  
+   (4) Optional coaching  
+
+This protocol is mandatory. Follow it every time.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
