@@ -1,261 +1,308 @@
 // src/lib/jarvis-memory.ts
-// ChatGPT-style memory engine for Jarvis using Supabase
-// Exports: saveMemoryItem, fetchRelevantMemories, shouldAskQuestion,
-//          summarizeMemory, extractMemoryFromMessage, buildPromptWithMemory
+// Memory engine using Groq embeddings by default.
+// Full replacement — drop into src/lib and replace previous file.
 
-import crypto from "crypto";
-import { createClient } from "@/lib/supabase/server"; // adapt path if needed
-import { getNowInfo, NowInfo } from "./time";
+import { createClient } from '@/lib/supabase/server';
+import { groqClient } from '@/lib/groq';
 
-const supabase = createClient(); // expects your existing server-side supabase creator
+const supabase = createClient();
 
-// --------------------------- Types ---------------------------
-export type MemoryItem = {
-  user_id: string | number;
-  type?: string; // e.g., "smalltalk", "preference", "trade", "event", "summary"
-  text: string;
-  tags?: string[]; // e.g., ["how_are_you"]
-  importance?: number; // 1-10
-  source?: string;
-  timezone?: string;
+type MemoryType = 'rule' | 'preference' | 'fact' | 'event' | 'trade_snapshot' | 'note';
+
+export interface JarvisMemory {
+  id?: string;
+  user_id: string;
+  type: MemoryType;
+  title: string;
+  content: any;
+  embedding?: number[] | null;
+  importance?: number;
+  tags?: string[];
+  status?: 'active' | 'archived';
   created_at?: string;
-  hash?: string;
-};
-
-// --------------------------- Utilities ---------------------------
-function makeHash(text: string) {
-  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
-}
-
-function normalizeTags(tags?: string[] | string) {
-  if (!tags) return [];
-  if (Array.isArray(tags)) return tags.map((t) => t.toLowerCase());
-  return [tags.toLowerCase()];
-}
-
-// --------------------------- Core DB functions ---------------------------
-/**
- * Save a memory item (upserts by user_id + hash to avoid exact duplicates)
- */
-export async function saveMemoryItem(item: MemoryItem) {
-  const now = getNowInfo(item.timezone || "Asia/Kolkata");
-  const hash = item.hash || makeHash(item.text);
-  const record = {
-    user_id: item.user_id?.toString(),
-    type: item.type || "misc",
-    text: item.text,
-    // Cast tags to any to satisfy supabase client typing for arrays
-    tags: normalizeTags(item.tags) as unknown as string,
-    importance: item.importance ?? 3,
-    source: item.source || "app",
-    hash,
-    created_at: item.created_at || now.iso,
-    timezone: item.timezone || now.timezone,
-  };
-
-  // NOTE: Supabase client typings sometimes expect an array for upsert(...) — pass an array and cast to any
-  const { data, error } = await supabase
-    .from("jarvis_memory")
-    .upsert([record] as any, { onConflict: "user_id,hash" });
-
-  if (error) {
-    console.error("saveMemoryItem error", error);
-    throw error;
-  }
-  return data;
+  updated_at?: string;
 }
 
 /**
- * Fetch relevant memories for a user with recency + importance weighting.
- * - intent: optional tag/keyword to filter (e.g., 'trading', 'how_are_you')
- * - horizonHours: timeframe to consider (default 7 days)
- * - maxItems: maximum records returned
+ * embedText: uses groqClient.embed(...) to produce embedding vectors.
+ * - Model name here is 'embed-1536' as placeholder; change if your Groq account uses another name.
+ * - The function returns a number[] embedding suitable for storing in Supabase vector column.
  */
-export async function fetchRelevantMemories(
-  userId: string | number,
-  intent: string | null = null,
-  horizonHours = 24 * 7,
-  maxItems = 12
-) {
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - horizonHours * 3600 * 1000).toISOString();
+export async function embedText(text: string): Promise<number[]> {
+  if (!text || !text.trim()) throw new Error('embedText: empty text');
 
-  let query = supabase
-    .from("jarvis_memory")
-    .select("*")
-    .eq("user_id", userId.toString())
-    .gte("created_at", cutoff)
-    .order("importance", { ascending: false })
-    .order("created_at", { ascending: false });
+  // Primary: use groqClient.embed if available
+  try {
+    if (!groqClient || typeof (groqClient as any).embed !== 'function') {
+      throw new Error('groqClient.embed not available');
+    }
 
-  if (intent) {
-    // use a cast to text for tags (Postgres text[] cast). Some Supabase clients support ilike on tags::text
-    query = (query as any).ilike("tags::text", `%${intent.toLowerCase()}%`);
+    const resp = await (groqClient as any).embed({
+      model: 'embed-1536', // change if your Groq embedding model name differs
+      input: text,
+    });
+
+    // Common response shapes handled:
+    // - { data: [{ embedding: [...] }, ...] }
+    // - { embedding: [...] }
+    if (resp?.data && Array.isArray(resp.data) && resp.data[0]?.embedding) {
+      return resp.data[0].embedding;
+    }
+    if (Array.isArray(resp) && resp[0]?.embedding) {
+      return resp[0].embedding;
+    }
+    if (resp?.embedding) {
+      return resp.embedding;
+    }
+
+    throw new Error('embed response missing embedding');
+  } catch (err: any) {
+    console.error('embedText (groq) failed:', err?.message ?? err);
+    throw new Error('Embedding failed (groq). Check groqClient and model name.');
   }
-
-  const { data, error } = await (query as any).limit(maxItems);
-
-  if (error) {
-    console.error("fetchRelevantMemories error", error);
-    return [];
-  }
-  return data || [];
 }
 
 /**
- * Decide whether Jarvis should ask a question again.
- * questionKey is a tag like 'how_are_you'
- * horizonHours: do not re-ask if answered within this many hours
- * returns { shouldAsk: boolean, lastAnswer?: string|null, lastAt?: string|null }
+ * extractTextFromContent: Pulls readable text from JSON content for embedding generation.
+ * Keeps input sizes reasonable by trimming to 8192 chars.
  */
-export async function shouldAskQuestion(
-  userId: string | number,
-  questionKey: string,
-  horizonHours = 24
-) {
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - horizonHours * 3600 * 1000).toISOString();
-  // use a safe cast for ilike on tags
-  const { data, error } = await (supabase
-    .from("jarvis_memory")
-    .select("*") as any)
-    .ilike("tags::text", `%${questionKey}%`)
-    .gte("created_at", cutoff)
-    .order("created_at", { ascending: false })
-    .limit(1);
+export function extractTextFromContent(content: any): string {
+  if (!content) return '';
+  if (typeof content === 'string') return content.slice(0, 8192);
+  try {
+    const strings: string[] = [];
+    const stack: any[] = [content];
 
-  if (error) {
-    console.error("shouldAskQuestion error", error);
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur) continue;
+      if (typeof cur === 'string') {
+        strings.push(cur);
+        continue;
+      }
+      if (Array.isArray(cur)) {
+        for (let i = cur.length - 1; i >= 0; --i) stack.push(cur[i]);
+        continue;
+      }
+      if (typeof cur === 'object') {
+        for (const k of Object.keys(cur)) {
+          const v = cur[k];
+          if (typeof v === 'string') strings.push(v);
+          else stack.push(v);
+        }
+      }
+      if (strings.join(' ').length > 8000) break;
+    }
+
+    const joined = strings.join(' ').replace(/\s+/g, ' ').trim();
+    return joined.slice(0, 8192);
+  } catch (e) {
+    return JSON.stringify(content).slice(0, 8192);
   }
-
-  const last = (data && data[0]) || null;
-  return { shouldAsk: !last, lastAnswer: last ? last.text : null, lastAt: last ? last.created_at : null };
 }
 
 /**
- * Summarize memory (simple reducer or LLM summarizer hook).
- * - For production: replace internal summarizer below with an LLM summarization call
- *   that condenses many memory items into a short paragraph.
+ * saveMemory: inserts a memory into the memories table.
+ * - will compute embedding using Groq if not provided.
+ * - returns inserted row on success.
  */
-export async function summarizeMemory(userId: string | number, horizonHours = 24 * 30) {
-  const items = await fetchRelevantMemories(userId, null, horizonHours, 200);
-  if (!items || items.length === 0) return { summary_short: "", count: 0 };
+export async function saveMemory(mem: JarvisMemory) {
+  try {
+    const contentText = extractTextFromContent(mem.content);
+    const embedding = mem.embedding ?? (contentText ? await embedText(contentText) : null);
 
-  // Lightweight summarizer: take top 20 and join; you can replace with LLM call.
-  const short = items
-    .slice(0, 20)
-    .map((it: any) => `${it.type}:${(it.text || "").slice(0, 160)}`)
-    .join("\n");
+    const row = {
+      user_id: mem.user_id,
+      type: mem.type,
+      title: mem.title,
+      content: mem.content,
+      embedding: embedding ?? null,
+      importance: mem.importance ?? 1,
+      tags: mem.tags ?? [],
+      status: mem.status ?? 'active',
+    };
 
-  return { summary_short: short, count: items.length, top: items.slice(0, 10) };
+    const { data, error } = await supabase.from('memories').insert(row).select().single();
+    if (error) {
+      console.error('saveMemory supabase error:', error);
+      return { error };
+    }
+    return { data };
+  } catch (err) {
+    console.error('saveMemory exception:', err);
+    return { error: err };
+  }
 }
 
-// --------------------------- Extraction ---------------------------
 /**
- * Basic heuristic-based memory extractor.
- * Given a message text, decide if it should be saved and how to tag it.
- * This is intentionally simple — swap in an LLM extractor for production.
+ * upsertMemoryEmbedding: update embedding for an existing memory id.
  */
-export function extractMemoryFromMessage(message: string) {
-  const text = (message || "").trim();
-  if (!text) return null;
-
-  const tags: string[] = [];
-  let type = "misc";
-  let importance = 3;
-
-  const lowered = text.toLowerCase();
-
-  // smalltalk detection
-  if (/(how('| i)?s your day|how are you|how's your day|how are you doing)/i.test(lowered)) {
-    type = "smalltalk";
-    tags.push("how_are_you");
-    importance = 2;
+export async function upsertMemoryEmbedding(memoryId: string, embedding: number[]) {
+  try {
+    const { data, error } = await supabase
+      .from('memories')
+      .update({ embedding })
+      .eq('id', memoryId)
+      .select()
+      .single();
+    if (error) {
+      console.error('upsertMemoryEmbedding error:', error);
+      return { error };
+    }
+    return { data };
+  } catch (err) {
+    console.error('upsertMemoryEmbedding exception:', err);
+    return { error: err };
   }
-  // user preference / profile simple patterns
-  if (/i (prefer|like|love|hate) /i.test(lowered) || /my (name|age|job)/i.test(lowered)) {
-    type = "preference";
-    tags.push("preference");
-    importance = 8;
-  }
-  // trade or numeric content
-  if (/(loss|win|profit|pnl|-?r|trade|drawdown|long|short|entered at|exited at)/i.test(lowered)) {
-    type = "trade";
-    tags.push("trade");
-    importance = 7;
-  }
-  // emotional state
-  if (/(sad|bad|depressed|stressed|happy|excited|angry)/i.test(lowered)) {
-    tags.push("emotion");
-    importance = Math.max(importance, 6);
-  }
-
-  // If nothing matched, ignore saving by default (avoid noisy store)
-  const shouldSave = type !== "misc" || tags.length > 0;
-  if (!shouldSave) return null;
-
-  return {
-    text,
-    type,
-    tags,
-    importance,
-  } as Partial<MemoryItem>;
 }
 
-// --------------------------- Prompt builder ---------------------------
 /**
- * Build system prompt parts to inject into LLM call.
- * - nowInfo: result of getNowInfo()
- * - memorySummary: output of summarizeMemory()
- * - lastAnswersForQuestions: optionally pass lastAnswer for blocked re-ask
+ * getRelevantMemories: uses RPC match_memories if embedding provided or can be created.
+ * - Accepts userId and either queryEmbedding or queryText.
+ * - Falls back to a simple textual search if embedding or RPC fails.
  */
-export function buildPromptWithMemory({
-  nowInfo,
-  memorySummary,
-  lastAnswersForQuestions,
+export async function getRelevantMemories({
+  userId,
+  queryText,
+  queryEmbedding,
+  limit = 6,
 }: {
-  nowInfo: NowInfo;
-  memorySummary?: { summary_short: string; count: number };
-  lastAnswersForQuestions?: Record<string, { lastAnswer: string | null; lastAt?: string | null }>;
+  userId: string;
+  queryText?: string;
+  queryEmbedding?: number[] | null;
+  limit?: number;
 }) {
-  const timeBlock = `Time context:
-- now: ${nowInfo.human} (ISO: ${nowInfo.iso})
-- timezone: ${nowInfo.timezone}
-- phase: ${nowInfo.phase}
-`;
+  try {
+    // If caller provided embedding, prefer RPC
+    if (queryEmbedding && Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
+      const { data, error } = await supabase
+        .rpc('match_memories', { p_user_id: userId, p_query_embedding: queryEmbedding, p_limit: limit });
+      if (!error && data) return { data };
+      console.warn('match_memories RPC returned error:', error);
+    }
 
-  const memoryBlock = memorySummary && memorySummary.summary_short
-    ? `Recent memory summary (condensed):\n${memorySummary.summary_short}\n--- End memory summary ---`
-    : "Recent memory summary: (no recent memory)";
+    // If queryText exists, generate embedding via Groq and call RPC
+    if (queryText && queryText.trim()) {
+      try {
+        const emb = await embedText(queryText);
+        const { data, error } = await supabase
+          .rpc('match_memories', { p_user_id: userId, p_query_embedding: emb, p_limit: limit });
+        if (!error && data) return { data };
+        console.warn('match_memories after emb error:', error);
+      } catch (e) {
+        console.warn('embedding for search failed:', (e as Error).message ?? e);
+      }
+    }
 
-  let repeatHints = "";
-  if (lastAnswersForQuestions) {
-    repeatHints = Object.entries(lastAnswersForQuestions)
-      .map(([k, v]) => {
-        if (!v.lastAnswer) return "";
-        return `Question-key: ${k} -> Last answer (at ${v.lastAt || "unknown"}): "${v.lastAnswer}"`;
-      })
-      .filter(Boolean)
-      .join("\n");
-    if (repeatHints) repeatHints = `Repeat control:\n${repeatHints}\nDo not re-ask any of the above questions unless the user explicitly requests an update.`;
+    // final fallback: text search on title/content
+    if (queryText && queryText.trim()) {
+      const { data, error } = await supabase
+        .from('memories')
+        .select('id, title, content, importance, tags, created_at, updated_at')
+        .ilike('title', `%${queryText}%`)
+        .or(`content::text.ilike.%${queryText}%`)
+        .limit(limit);
+      if (!error && data) return { data };
+      console.warn('fallback text search error:', error);
+      return { data: [] };
+    }
+
+    // default: return recent high importance memories for user
+    const { data, error } = await supabase
+      .from('memories')
+      .select('id, title, content, importance, tags, created_at, updated_at')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('importance', { ascending: false })
+      .limit(limit);
+    if (!error && data) return { data };
+    return { data: [] };
+  } catch (err) {
+    console.error('getRelevantMemories exception:', err);
+    return { error: err };
   }
-
-  // Final system instruction template
-  const systemPrompt = `
-You are Jarvis — a helpful, stable, and precise assistant specialized in assisting this user.
-${timeBlock}
-
-${memoryBlock}
-
-${repeatHints}
-
-Rules:
-- Always consult the memory summary before asking personal or repeated questions.
-- Do NOT ask the same small-talk or personal question if the user answered it within the configured horizon (server-side check handles this).
-- If you must reference a prior answer, do so concisely and ask if they want to update it.
-- Prioritize short, actionable replies when the user's recent messages show trading context.
-
-End system instructions.
-`;
-  return systemPrompt;
 }
+
+/**
+ * saveConversation: store session-level conversation snapshots
+ * - attempts to embed summary/messages when possible
+ */
+export async function saveConversation({
+  userId,
+  messages,
+  summary,
+  embedding,
+}: {
+  userId: string;
+  messages: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[];
+  summary?: string;
+  embedding?: number[] | null;
+}) {
+  try {
+    const summaryText = summary ?? messages.map(m => `${m.role}: ${m.content}`).join('\n').slice(0, 8000);
+    const emb = embedding ?? (summaryText ? await embedText(summaryText) : null);
+
+    const row = {
+      user_id: userId,
+      messages,
+      summary: summaryText,
+      embedding: emb ?? null,
+      last_active: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase.from('conversations').insert(row).select().single();
+    if (error) {
+      console.error('saveConversation error:', error);
+      return { error };
+    }
+    return { data };
+  } catch (err) {
+    console.error('saveConversation exception:', err);
+    return { error: err };
+  }
+}
+
+/**
+ * summarizeIfNeeded: light wrapper using Groq to summarize long text; fallback to truncation
+ */
+export async function summarizeIfNeeded(text: string, maxLen = 800) {
+  if (!text || text.length <= maxLen) return text;
+  try {
+    if (groqClient && typeof (groqClient as any).complete === 'function') {
+      const prompt = `Summarize the following text into 1-3 concise sentences, keeping facts and timestamps:\n\n${text}`;
+      const resp = await (groqClient as any).complete({
+        prompt,
+        temperature: 0.0,
+        max_tokens: 200,
+      });
+      const summary = resp?.choices?.[0]?.text ?? resp?.output ?? null;
+      if (summary) return String(summary).trim().slice(0, maxLen);
+    }
+  } catch (e) {
+    console.warn('summarizeIfNeeded groq failed:', (e as Error).message ?? e);
+  }
+  return text.slice(0, maxLen) + '...';
+}
+
+/** Simple journal write helper */
+export async function writeJournal(userId: string, message: any, source = 'jarvis-memory') {
+  try {
+    const { data, error } = await supabase.from('journal').insert({ user_id: userId, message, source }).select().single();
+    if (error) console.warn('writeJournal error:', error);
+    return { data, error };
+  } catch (e) {
+    console.error('writeJournal exception:', e);
+    return { error: e };
+  }
+}
+
+export default {
+  embedText,
+  extractTextFromContent,
+  saveMemory,
+  upsertMemoryEmbedding,
+  getRelevantMemories,
+  saveConversation,
+  summarizeIfNeeded,
+  writeJournal,
+};
