@@ -455,13 +455,17 @@ CONVERSATION & LISTENING:
     // Return the assistant's whole reply to web chat (including any JSON block)
     return NextResponse.json({ reply: replyContent }, { status: 200 });
   } catch (error: unknown) {
-    console.error("CHAT API ERROR:", error);
-    const message =
-      error instanceof Error ? error.message : String(error);
+console.error("CHAT API ERROR:", error);
+const message =
+  error instanceof Error
+    ? error.message
+    : typeof error === "object"
+    ? JSON.stringify(error, Object.getOwnPropertyNames(error))
+    : String(error);
 
-    return NextResponse.json(
-      { reply: "Jarvis brain crashed: " + message },
-      { status: 200 }
-    );
+return NextResponse.json(
+  { reply: "Jarvis brain crashed: " + message },
+  { status: 200 }
+);
   }
 }
