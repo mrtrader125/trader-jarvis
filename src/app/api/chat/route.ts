@@ -10,6 +10,9 @@ import {
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
+import { tryCreateReminderFromText } from "@/lib/jarvis/reminders";
+
+// Preserved imports from OLD file (used by trading memory, tone, history, etc.)
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
 import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
 import {
@@ -126,24 +129,66 @@ export async function POST(req: NextRequest) {
     const lastUserContent =
       lastMessage?.role === "user" ? lastMessage.content : undefined;
 
-    // --- Update trading memory automatically from what you say ---
+    // --- Update trading memory automatically from what you say (preserve old behavior) ---
     if (lastUserContent) {
-      await autoUpdateTradingMemoryFromUtterance(supabase, lastUserContent);
+      try {
+        await autoUpdateTradingMemoryFromUtterance(supabase, lastUserContent);
+      } catch (e) {
+        console.error("autoUpdateTradingMemoryFromUtterance error:", e);
+      }
     }
 
-    // --- 0) Pure time questions: handled in backend, NOT LLM ---
+    // --- 0) Reminder creation (web) (NEW file behavior preserved) ---
+    if (lastUserContent) {
+      try {
+        const reminderResult = await tryCreateReminderFromText({
+          text: lastUserContent,
+          supabase,
+          source: "web",
+          timezone,
+        });
+
+        if (reminderResult) {
+          // Save into history as well (preserve old history saving behavior).
+          try {
+            await saveHistoryPair({
+              supabase,
+              channel: "web",
+              userText: lastUserContent,
+              assistantText: reminderResult.confirmation,
+            });
+          } catch (e) {
+            console.error("Error saving reminder confirmation to history:", e);
+          }
+
+          return NextResponse.json(
+            { reply: reminderResult.confirmation },
+            { status: 200 }
+          );
+        }
+      } catch (e) {
+        console.error("tryCreateReminderFromText error:", e);
+      }
+    }
+
+    // --- 0.1) Pure time questions: handled in backend, NOT LLM ---
     if (isTimeQuestion(lastUserContent)) {
       const reply = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      await saveHistoryPair({
-        supabase,
-        channel: "web",
-        userText: lastUserContent ?? null,
-        assistantText: reply,
-      });
+      try {
+        await saveHistoryPair({
+          supabase,
+          channel: "web",
+          userText: lastUserContent ?? null,
+          assistantText: reply,
+        });
+      } catch (e) {
+        console.error("Error saving time reply to history:", e);
+      }
       return NextResponse.json({ reply }, { status: 200 });
     }
 
-    // --- 0.5) "How much percent of target" questions: backend math only ---
+    // --- 0.2) "How much percent of target" questions: backend math only ---
+    // Combine conservative intent detection from OLD file with the direct helper check.
     const percentQuestionIntent =
       !!lastUserContent &&
       (
@@ -161,12 +206,16 @@ export async function POST(req: NextRequest) {
     ) {
       const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
       if (answer) {
-        await saveHistoryPair({
-          supabase,
-          channel: "web",
-          userText: lastUserContent,
-          assistantText: answer,
-        });
+        try {
+          await saveHistoryPair({
+            supabase,
+            channel: "web",
+            userText: lastUserContent,
+            assistantText: answer,
+          });
+        } catch (e) {
+          console.error("Error saving percent answer to history:", e);
+        }
         return NextResponse.json({ reply: answer }, { status: 200 });
       }
     }
@@ -191,17 +240,23 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    // --- 1.5) Load shared recent history (web + telegram) ---
-    const recentHistory = await loadRecentHistory({
-      supabase,
-      userId: "single-user",
-      limit: 10,
-    });
+    // --- 1.5) Load shared recent history (web + telegram) (preserve OLD behavior) ---
+    let historyMessages: { role: "user" | "assistant"; content: string }[] = [];
+    try {
+      const recentHistory = await loadRecentHistory({
+        supabase,
+        userId: "single-user",
+        limit: 10,
+      });
 
-    const historyMessages = recentHistory.map((h) => ({
-      role: h.role as "user" | "assistant",
-      content: h.content,
-    }));
+      historyMessages = recentHistory.map((h) => ({
+        role: h.role as "user" | "assistant",
+        content: h.content,
+      }));
+    } catch (e) {
+      console.error("Error loading recent history:", e);
+      historyMessages = [];
+    }
 
     // --- 2) Build Knowledge Center context (your manual teachings) ---
     const intentTags = detectIntentTags(lastUserContent);
@@ -227,7 +282,7 @@ ${
             )
             .join("\n");
 
-    // --- 3) Profile & finance & trading profile ---
+    // --- 3) Profile & finance & trading profile (preserve old snippet/profile usage) ---
     const displayName = profile?.display_name || "Bro";
     const bio =
       profile?.bio ||
@@ -251,7 +306,7 @@ ${
     const tradingProfile = await loadTradingProfile(supabase);
     const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
-    // --- 3.1) Tone engine + style preferences ---
+    // --- 3.1) Tone engine + style preferences (from OLD file) ---
     const toneMode = detectToneMode(lastUserContent || "", "web");
     const toneDirective = buildToneDirective(toneMode, "web");
 
@@ -263,7 +318,7 @@ ${
 - When summarizing his life/rules/goals, avoid "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
 `;
 
-    // --- 3.2) Build Jarvis system prompt ---
+    // --- 3.2) Build Jarvis system prompt (merge of OLD & NEW prompts; OLD is more detailed so preserved) ---
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
@@ -410,12 +465,16 @@ Use the Knowledge Center rules and trading profile memory as the user's personal
         : "Sorry, I couldn't generate a response.";
 
     // --- 5) Save latest turn into shared history (web channel) ---
-    await saveHistoryPair({
-      supabase,
-      channel: "web",
-      userText: lastUserContent ?? null,
-      assistantText: replyContent,
-    });
+    try {
+      await saveHistoryPair({
+        supabase,
+        channel: "web",
+        userText: lastUserContent ?? null,
+        assistantText: replyContent,
+      });
+    } catch (e) {
+      console.error("Error saving chat reply to history:", e);
+    }
 
     return NextResponse.json({ reply: replyContent }, { status: 200 });
   } catch (error: unknown) {
