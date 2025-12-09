@@ -1,127 +1,120 @@
-// src/app/api/chat/route.ts
-import { NextResponse } from 'next/server';
-import type { NextRequest } from 'next/server';
-import composeLib from '@/lib/chat-composer';
-import memoryLib from '@/lib/jarvis-memory';
+// FILE: src/app/api/chat/route.ts
+export const runtime = "nodejs"; // ensure Node runtime if you need native libs or longer-running streams
 
-// Request/Response types used by this route
-type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string; ts?: string };
-type ChatRequestBody = {
-  userId: string;
-  messages?: ChatMessage[]; // recent conversation history (last 6 recommended)
-  instruction?: string; // optional single instruction (alternative to messages)
-  saveConversation?: boolean; // default true
-};
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { groqClient } from "@/lib/groq";
+import { getNowInfo } from "@/lib/time";
+import {
+  isPercentOfTargetQuestion,
+  buildPercentOfTargetAnswerFromText,
+} from "@/lib/jarvis/math";
+import { fetchMemoryForUser, saveMemory } from "@/lib/jarvis-memory";
+import { streamOpenAIResponse } from "@/lib/openai-stream"; // helper to stream OpenAI responses as ReadableStream
 
-// Basic JSON response envelope
-type ChatResponseBody = {
-  success: boolean;
-  text?: string;
-  provenance?: string[]; // memory ids referenced
-  raw?: any; // raw LLM response for debugging
-  error?: string;
-};
-
-export const runtime = 'edge'; // optional: use 'nodejs' if you need node libs
-
-async function parseJsonSafe(req: NextRequest) {
-  try {
-    const body = await req.json();
-    return body;
-  } catch (e) {
-    // Fallback for cases where body isn't JSON
-    return null;
-  }
-}
+// A robust chat route that:
+// - accepts messages array and userId
+// - injects memory and now-info
+// - detects math questions and handles deterministic math engine
+// - applies smalltalk suppression rules
+// - streams LLM response back to client
 
 export async function POST(req: NextRequest) {
-  const body = (await parseJsonSafe(req)) as ChatRequestBody | null;
-
-  if (!body) {
-    return NextResponse.json({ success: false, error: 'Invalid JSON body' } as ChatResponseBody, { status: 400 });
-  }
-
-  const userId = String(body.userId ?? '').trim();
-  if (!userId) {
-    return NextResponse.json({ success: false, error: 'Missing userId' } as ChatResponseBody, { status: 400 });
-  }
-
-  // Build conversation history - prefer messages if provided; else use instruction as a single user message
-  const messages: ChatMessage[] = Array.isArray(body.messages) && body.messages.length > 0
-    ? body.messages.map((m: any) => ({ role: m.role ?? 'user', content: String(m.content ?? ''), ts: m.ts }))
-    : (body.instruction ? [{ role: 'user', content: String(body.instruction), ts: new Date().toISOString() }] : []);
-
-  if (messages.length === 0) {
-    return NextResponse.json({ success: false, error: 'No messages or instruction provided' } as ChatResponseBody, { status: 400 });
-  }
-
-  // Keep a short window of recent messages for prompt composition (e.g., last 6)
-  const convoWindow = messages.slice(-6);
-
-  // The instruction to pass to composer: take instruction param if present, else last user message content
-  const instruction = body.instruction ? body.instruction : (convoWindow.length ? convoWindow.filter(m => m.role === 'user').slice(-1)[0]?.content ?? convoWindow.slice(-1)[0].content : '');
-
   try {
-    // Compose and call Jarvis (memory retrieval, persona, LLM call, deterministic math post-processing)
-    const result = await composeLib.composeAndCallJarvis({
-      userId,
-      instruction,
-      convoHistory: convoWindow,
-    });
-
-    // Save conversation snapshot asynchronously but don't block response heavily
-    // Include summary field equal to the first 800 chars of the assistant reply + last user msg
-    const summaryParts = [
-      convoWindow.map(m => `${m.role}: ${m.content}`).join('\n'),
-      'JARVIS_REPLY:',
-      (result?.text ?? '').slice(0, 800),
-    ];
-    const summary = summaryParts.join('\n').slice(0, 1200);
-
-    if (body.saveConversation !== false) {
-      // attempt to save conversation; do not fail the request if DB write fails
-      try {
-        await memoryLib.saveConversation({
-          userId,
-          messages: convoWindow,
-          summary,
-        });
-      } catch (e) {
-        // write a journal entry about the failure
-        await memoryLib.writeJournal(userId, { event: 'saveConversation_failed', error: String(e) }, 'chat-route');
-      }
-    }
-
-    // Always write a short journal for audit/tracing
-    try {
-      await memoryLib.writeJournal(userId, {
-        event: 'chat_request',
-        instruction,
-        provenance: result?.provenance ?? [],
-        snippet: (result?.text ?? '').slice(0, 400),
-      }, 'chat-route');
-    } catch (e) {
-      // journaling failure is non-fatal
-      console.warn('Journal write failed:', e);
-    }
-
-    // Return structured response
-    const resBody: ChatResponseBody = {
-      success: true,
-      text: result?.text ?? '',
-      provenance: result?.provenance ?? [],
-      raw: result?.raw ?? null,
+    const body = await req.json();
+    const { messages, userId } = body as {
+      messages: { role: string; content: string }[];
+      userId: string;
     };
 
-    return NextResponse.json(resBody, { status: 200 });
-  } catch (err: any) {
-    console.error('chat route error:', err);
-    // Attempt to journal the error for debugging
-    try {
-      await memoryLib.writeJournal(userId, { event: 'chat_error', error: String(err?.message ?? err) }, 'chat-route');
-    } catch (e) {
-      // ignore
+    if (!messages || !Array.isArray(messages) || !userId) {
+      return NextResponse.json(
+        { error: "Invalid request: messages and userId required" },
+        { status: 400 }
+      );
     }
-    return NextResponse.json({ success: false, error: String(err?.message ?? err) } as ChatResponseBody, { status: 500 });
+
+    // 1) Fetch short-term and long-term memory to inject
+    const supabase = createClient();
+    const memoryItems = await fetchMemoryForUser(supabase, userId, { limit: 6 });
+
+    // 2) Build context preface
+    const nowInfo = getNowInfo();
+    const memoryPreface = memoryItems && memoryItems.length
+      ? `Memory summary (most relevant):\n${memoryItems
+          .map((m: any, i: number) => `${i + 1}. ${m.summary}`)
+          .join("\n")}\n\n`
+      : "";
+
+    // 3) Smalltalk suppression: if the user prompt is casual smalltalk, encourage brevity
+    const lastUserMsg =
+      messages[messages.length - 1]?.content?.toLowerCase() ?? "";
+    const isSmalltalk = /^(hi|hello|hey|how are you|what's up|sup)\b/.test(
+      lastUserMsg
+    );
+
+    // 4) Deterministic math detection
+    const mathDetected = isPercentOfTargetQuestion(lastUserMsg);
+
+    // 5) Build system prompt
+    const systemPrompt = `You are Jarvis — a concise, accuracy-first trading assistant. Use the injected memory when helpful. Time: ${nowInfo.iso}
+${memoryPreface}`;
+
+    const payloadMessages = [{ role: "system", content: systemPrompt }, ...messages];
+
+    // 6) If mathDetected, compute deterministic answer first and return a combined response
+    if (mathDetected) {
+      const mathAnswer = buildPercentOfTargetAnswerFromText(lastUserMsg);
+
+      // **ADJUSTED TO PROJECT saveMemory SIGNATURE** (no 'source' field)
+      try {
+        // call project's saveMemory(userId, payload) - keep payload fields compatible with MemoryRow type
+        await saveMemory(userId, {
+          summary: `Answered math question: ${lastUserMsg} => ${mathAnswer}`,
+          data: { question: lastUserMsg, answer: mathAnswer },
+          importance: 5,
+        });
+      } catch (e) {
+        console.warn("saveMemory failed:", e);
+      }
+
+      const combined = `Deterministic answer:\n${mathAnswer}\n\nNow a short assistant explanation:`;
+      // append combined as an assistant-guide and then stream LLM expansion
+      payloadMessages.push({ role: "user", content: combined });
+
+      // stream response
+      const stream = await streamOpenAIResponse(payloadMessages, { userId });
+      return new Response(stream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
+    }
+
+    // 7) If smalltalk & our policy says suppress casual chatter, respond briefly without long context
+    if (isSmalltalk) {
+      // short canned reply — still stream to keep client compatibility
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"delta":"Hey — I’m Jarvis. How can I help with trading or project tasks today?"}\n\n'
+            )
+          );
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
+    }
+
+    // 8) Normal flow: stream the LLM response with memory injection
+    const stream = await streamOpenAIResponse(payloadMessages, { userId });
+    return new Response(stream, {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+    });
+  } catch (err: any) {
+    console.error("/api/chat error:", err);
+    return NextResponse.json({ error: err?.message ?? String(err) }, { status: 500 });
   }
 }
