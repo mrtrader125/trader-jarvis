@@ -1,145 +1,112 @@
 // src/lib/chat-composer.ts
-// Composer: retrieves memories, constructs prompt (persona + memories + convo), calls Groq, post-processes math placeholders
-// Full replacement — drop into src/lib.
+/**
+ * chat-composer.ts
+ *
+ * Composes prompt for Jarvis, fetches memory context, and calls Groq LLM.
+ * This file intentionally keeps a small shim converting options -> positional
+ * arguments when calling memoryLib.getRelevantMemories so the signature stays stable.
+ *
+ * Exports:
+ *  - composeAndCallJarvis({ userId, instruction, convoHistory })
+ *
+ * Note: This file assumes:
+ *  - '@/lib/jarvis-persona' exports buildSystemPrompt()
+ *  - '@/lib/jarvis-memory' exports getRelevantMemories and fetchRelevantMemories (default export memoryLib)
+ *  - '@/lib/groq' exports groqClient wrapper (or adapt as needed)
+ */
 
-import { createClient } from '@/lib/supabase/server';
 import { groqClient } from '@/lib/groq';
 import jarvisPersona from '@/lib/jarvis-persona';
 import memoryLib from '@/lib/jarvis-memory';
 import mathEngine from '@/lib/math-engine';
 
-const supabase = createClient();
-
 type Message = { role: 'user' | 'assistant' | 'system'; content: string; ts?: string };
 
-/**
- * buildPromptFromParts: builds a single string prompt suitable for Groq complete()
- */
-function buildPromptFromParts({ systemPrompt, memoryChunks, convoHistory, instruction }: {
-  systemPrompt: string;
-  memoryChunks: string[];
-  convoHistory: Message[];
-  instruction: string;
-}) {
-  const header = `SYSTEM:\n${systemPrompt}\n---\n`;
-  const memories = memoryChunks && memoryChunks.length ? `RELEVANT_MEMORIES:\n${memoryChunks.join('\n---\n')}\n---\n` : '';
-  const convo = convoHistory.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n');
-  const convoSection = `CONVERSATION:\n${convo}\n---\n`;
-  const instructionSection = `INSTRUCTION:\n${instruction}\n`;
-  return `${header}${memories}${convoSection}${instructionSection}`;
-}
-
-/**
- * formatMemoryChunk: format memory rows into compact prompt chunks
- */
-function formatMemoryChunk(m: any) {
-  const title = m.title ?? 'untitled';
-  const id = m.id ?? '';
-  const importance = m.importance ?? 1;
-  const tags = Array.isArray(m.tags) ? m.tags.join(', ') : '';
-  // Stringify content but keep it short
-  let contentStr = '';
-  try {
-    if (typeof m.content === 'string') contentStr = m.content;
-    else contentStr = JSON.stringify(m.content);
-  } catch (e) {
-    contentStr = String(m.content);
-  }
-  if (contentStr.length > 1200) contentStr = contentStr.slice(0, 1200) + '...';
-  return `MEMORY_ID:${id} | TITLE:${title} | IMPORTANCE:${importance} | TAGS:${tags}\n${contentStr}`;
-}
-
-/**
- * postProcessMathPlaceholders:
- * Finds [[MATH: ...expression...]] placeholders in text and replaces them with deterministic math results.
- * Expression syntax is intentionally simple; we pass expression to mathEngine.evaluateExpression for safety.
- */
-async function postProcessMathPlaceholders(text: string) {
-  const regex = /\[\[MATH:(.+?)\]\]/g;
-  const replacements: Record<string, string> = {};
-  const promises: Promise<void>[] = [];
-
-  text = text.replace(regex, (full, expr) => {
-    const token = `__MATH_TOKEN_${Math.random().toString(36).slice(2,9)}__`;
-    promises.push((async () => {
-      try {
-        const val = mathEngine.evaluateExpression(expr.trim());
-        replacements[token] = String(val);
-      } catch (e) {
-        replacements[token] = `ERROR:${String((e as Error).message ?? e)}`;
-      }
-    })());
-    return token;
-  });
-
-  await Promise.all(promises);
-  for (const [k, v] of Object.entries(replacements)) {
-    text = text.split(k).join(v);
-  }
-  return text;
-}
-
-/**
- * composeAndCallJarvis: primary function to call from API routes
- * - userId: user's identifier (string)
- * - instruction: the user's new instruction (string)
- * - convoHistory: array of recent messages
- */
-export async function composeAndCallJarvis({ userId, instruction, convoHistory }: {
+type ComposeArgs = {
   userId: string;
   instruction: string;
-  convoHistory: Message[];
-}) {
-  // 1) Build system persona
-  const systemPrompt = jarvisPersona.buildSystemPrompt();
+  convoHistory?: Message[];
+  memoryLimit?: number;
+};
 
-  // 2) Retrieve top memories related to instruction
-  let memResp: any = { data: [] };
+const DEFAULT_MEMORY_LIMIT = 6;
+
+/** Build prompt from persona + memory + convo */
+async function buildPrompt(userId: string, instruction: string, convoHistory: Message[], memoryLimit = DEFAULT_MEMORY_LIMIT) {
+  // 1) system prompt
+  const system = jarvisPersona.buildSystemPrompt();
+
+  // 2) fetch recent memories — positional args: (userId, tagFilter, daysRange, limit)
+  // We intentionally pass null for tagFilter and daysRange here.
+  const memRows = await memoryLib.getRelevantMemories(userId, null, null, memoryLimit);
+
+  // Map memories into short text chunks
+  const memoryTexts = memRows.map((m: any) => {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (m.title && !m.content) return String(m.title);
+    if (m.content && typeof m.content === 'object') {
+      return m.content.text ?? m.content.body ?? m.content.note ?? m.title ?? JSON.stringify(m.content);
+    }
+    return String(m.content ?? m.title ?? '');
+  });
+
+  // 3) session history (last N messages)
+  const historyText = (convoHistory || [])
+    .slice(-6)
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join('\n');
+
+  // Compose final prompt
+  const parts = [
+    system,
+    '\n\n-- Retrieved memories (most recent first) --\n' + (memoryTexts.length ? memoryTexts.join('\n---\n') : 'No relevant memory found.'),
+    '\n\n-- Recent session --\n' + (historyText || 'No recent messages.'),
+    '\n\n-- User instruction --\n' + instruction,
+    '\n\n-- Rules --\nAlways use deterministic math engine for numeric calcs.',
+  ];
+
+  return parts.join('\n\n');
+}
+
+/** Main composer: builds prompt, calls LLM, post-processes (runs math engine if required) */
+export async function composeAndCallJarvis(opts: ComposeArgs) {
+  const { userId, instruction, convoHistory = [], memoryLimit = DEFAULT_MEMORY_LIMIT } = opts;
+
+  // 1) build prompt
+  const prompt = await buildPrompt(userId, instruction, convoHistory, memoryLimit);
+
+  // 2) call LLM (groqClient wrapper). Keep temperature low for deterministic answers.
+  // If your groqClient API differs, adapt the call below.
+  let llmResp: any;
   try {
-    memResp = await memoryLib.getRelevantMemories({ userId, queryText: instruction, limit: 6 });
-  } catch (e) {
-    console.warn('composeAndCallJarvis: memoryLib.getRelevantMemories failed', e);
-  }
-  const rawMems = memResp?.data ?? [];
-
-  // 3) Format memory chunks
-  const memoryChunks = (rawMems || []).map(formatMemoryChunk);
-
-  // 4) Build prompt text
-  const prompt = buildPromptFromParts({ systemPrompt, memoryChunks, convoHistory, instruction });
-
-  // 5) Call Groq for completion
-  let groqResp: any = null;
-  try {
-    groqResp = await (groqClient as any).complete({
+    llmResp = await groqClient.call({
       prompt,
-      temperature: 0.12,
-      max_tokens: 700,
+      temperature: 0.0,
+      max_tokens: 800,
     });
   } catch (e) {
-    console.error('groqClient.complete error:', e);
-    throw new Error('LLM call failed');
+    throw new Error('LLM call failed: ' + String(e));
   }
 
-  // extract text from common response shapes
-  let generated = groqResp?.choices?.[0]?.text ?? groqResp?.output ?? (typeof groqResp === 'string' ? groqResp : '');
+  // 3) post-process: run any simple arithmetic placeholders through math engine.
+  // We look for patterns like [[calc:1+2]] and replace with deterministic result.
+  let text = String(llmResp?.text ?? llmResp?.output ?? llmResp);
 
-  // 6) Post-process math placeholders deterministically
-  try {
-    generated = await postProcessMathPlaceholders(generated);
-  } catch (e) {
-    console.warn('postProcessMathPlaceholders failed:', e);
-  }
+  // simple calc replacement: [[calc:expr]]
+  text = text.replace(/\[\[calc:([^\]]+)\]\]/g, (m, expr) => {
+    try {
+      const val = mathEngine.evaluateExpression(String(expr).trim());
+      return String(val);
+    } catch (e) {
+      return `[calc_error:${String(e?.message ?? e)}]`;
+    }
+  });
 
-  // 7) Prepare provenance (list memory ids included)
-  const provenance = (rawMems || []).slice(0, 6).map((m: any) => m.id).filter(Boolean);
+  // Build provenance (if LLM returned sources, include them)
+  const provenance = llmResp?.provenance ?? [];
 
-  // 8) Return composed response
-  return {
-    text: String(generated).trim(),
-    provenance,
-    raw: groqResp,
-  };
+  return { text, raw: llmResp, provenance };
 }
 
 export default {
