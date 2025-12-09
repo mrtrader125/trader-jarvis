@@ -1,57 +1,39 @@
 // src/lib/telegram.ts
-// Minimal Telegram helper for sending messages and handling basic responses.
-// Exports sendTelegramMessage(chatId, text, opts) which will attempt to post via Telegram Bot API.
-// Uses env TELEGRAM_BOT_TOKEN and optional TELEGRAM_CHAT_ID (fallback for quick testing).
+// sendToTelegram helper used by api/telegram route.
+// Exports named function sendToTelegram(chatId, text) and default export for backward compatibility.
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const FALLBACK_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
-
-/**
- * Send a text message to Telegram chat.
- * - chatId may be null; if so, FALLBACK_CHAT_ID will be used if present.
- * - Throws an Error with helpful description on failure.
- */
-export async function sendTelegramMessage(chatId: string | number | null, text: string, opts?: { parseMode?: string }) {
-  if (!TELEGRAM_TOKEN) {
-    throw new Error("TELEGRAM_BOT_TOKEN not configured");
-  }
-  const target = chatId || FALLBACK_CHAT_ID;
-  if (!target) {
-    throw new Error("No Telegram chat_id available. Link your Telegram account to enable bot messages.");
+export async function sendToTelegram(chatId: string | number, text: string, opts?: { parseMode?: "Markdown" | "HTML" }) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!BOT_TOKEN) {
+    console.warn("sendToTelegram: TELEGRAM_BOT_TOKEN missing");
+    throw new Error("Missing TELEGRAM_BOT_TOKEN env var");
   }
 
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-  const payload = {
-    chat_id: String(target),
-    text,
-    parse_mode: opts?.parseMode || "Markdown",
-    disable_web_page_preview: true,
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const body: any = {
+    chat_id: chatId,
+    text: String(text),
   };
 
-  const resp = await fetch(url, {
+  if (opts?.parseMode) body.parse_mode = opts.parseMode;
+
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 
-  let json: any;
-  try {
-    json = await resp.json();
-  } catch (e) {
-    throw new Error(`Telegram returned non-JSON response (status ${resp.status})`);
+  if (!res.ok) {
+    const txt = await res.text();
+    console.warn("sendToTelegram failed:", res.status, txt);
+    throw new Error(`sendToTelegram failed: ${res.status} ${txt}`);
   }
 
-  if (!json || json.ok === false) {
-    // Telegram provides { ok: false, error_code, description, parameters? }
-    const desc = json?.description || JSON.stringify(json);
-    const err = new Error(`Telegram send failed: ${desc}`);
-    (err as any).telegram = json;
-    throw err;
-  }
-
-  return json.result;
+  const json = await res.json();
+  return json;
 }
 
+// For older callers importing default
 export default {
-  sendTelegramMessage,
+  sendToTelegram,
 };
