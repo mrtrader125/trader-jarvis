@@ -1,5 +1,4 @@
 // trader-jarvis/src/app/api/chat/route.ts
-
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { groqClient } from "@/lib/groq";
@@ -10,16 +9,54 @@ import {
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
-import { tryCreateReminderFromText } from "@/lib/jarvis/reminders";
 
-// Preserved imports from OLD file (used by trading memory, tone, history, etc.)
-import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
-import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
-import {
-  autoUpdateTradingMemoryFromUtterance,
-  loadTradingProfile,
-  buildTradingProfileSnippet,
-} from "@/lib/jarvis/tradingMemory";
+/**
+ * Heuristic: If the assistant's last message asked "which setup..." and the user responded
+ * with any known instrument/market word, we'll short-circuit and avoid calling LLM to ask again.
+ */
+function likelyAnswersSetupQuestion(text: string | undefined | null) {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  const setupWords = [
+    "gold",
+    "silver",
+    "nifty",
+    "banknifty",
+    "btc",
+    "ethereum",
+    "eth",
+    "eurusd",
+    "usd",
+    "usdjpy",
+    "audusd",
+    "nasdaq",
+    "spy",
+    "tesla",
+    "goog",
+  ];
+  return setupWords.some((w) => q.includes(w));
+}
+
+function lastAssistantAskedSetup(messages: { role: string; content: string }[]) {
+  // find last assistant content
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant") {
+      const c = m.content.toLowerCase();
+      if (
+        c.includes("which setup") ||
+        c.includes("which one was it") ||
+        c.includes("which setup are we talking") ||
+        c.includes("which pair") ||
+        c.includes("which instrument")
+      ) {
+        return true;
+      }
+      return false;
+    }
+  }
+  return false;
+}
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -41,10 +78,6 @@ function isTimeQuestion(text: string | undefined | null): boolean {
   );
 }
 
-/**
- * Very simple tag detector for the Knowledge Center.
- * This decides which knowledge items are most relevant for this question.
- */
 function detectIntentTags(text: string | undefined): string[] {
   if (!text) return ["general"];
   const q = text.toLowerCase();
@@ -69,11 +102,7 @@ function detectIntentTags(text: string | undefined): string[] {
     q.includes("revenge") ||
     q.includes("discipline") ||
     q.includes("tilt") ||
-    q.includes("mindset") ||
-    q.includes("worried") ||
-    q.includes("worry") ||
-    q.includes("stress") ||
-    q.includes("stressed")
+    q.includes("mindset")
   ) {
     tags.push("psychology");
   }
@@ -83,7 +112,6 @@ function detectIntentTags(text: string | undefined): string[] {
     q.includes("salary") ||
     q.includes("expenses") ||
     q.includes("freedom") ||
-    q.includes("worry free") ||
     q.includes("runway") ||
     q.includes("minimum required")
   ) {
@@ -129,94 +157,25 @@ export async function POST(req: NextRequest) {
     const lastUserContent =
       lastMessage?.role === "user" ? lastMessage.content : undefined;
 
-    // --- Update trading memory automatically from what you say (preserve old behavior) ---
-    if (lastUserContent) {
-      try {
-        await autoUpdateTradingMemoryFromUtterance(supabase, lastUserContent);
-      } catch (e) {
-        console.error("autoUpdateTradingMemoryFromUtterance error:", e);
-      }
-    }
-
-    // --- 0) Reminder creation (web) (NEW file behavior preserved) ---
-    if (lastUserContent) {
-      try {
-        const reminderResult = await tryCreateReminderFromText({
-          text: lastUserContent,
-          supabase,
-          source: "web",
-          timezone,
-        });
-
-        if (reminderResult) {
-          // Save into history as well (preserve old history saving behavior).
-          try {
-            await saveHistoryPair({
-              supabase,
-              channel: "web",
-              userText: lastUserContent,
-              assistantText: reminderResult.confirmation,
-            });
-          } catch (e) {
-            console.error("Error saving reminder confirmation to history:", e);
-          }
-
-          return NextResponse.json(
-            { reply: reminderResult.confirmation },
-            { status: 200 }
-          );
-        }
-      } catch (e) {
-        console.error("tryCreateReminderFromText error:", e);
-      }
-    }
-
-    // --- 0.1) Pure time questions: handled in backend, NOT LLM ---
+    // --- 0) Pure time questions: handled in backend, NOT LLM ---
     if (isTimeQuestion(lastUserContent)) {
-      const reply = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      try {
-        await saveHistoryPair({
-          supabase,
-          channel: "web",
-          userText: lastUserContent ?? null,
-          assistantText: reply,
-        });
-      } catch (e) {
-        console.error("Error saving time reply to history:", e);
-      }
+      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       return NextResponse.json({ reply }, { status: 200 });
     }
 
-    // --- 0.2) "How much percent of target" questions: backend math only ---
-    // Combine conservative intent detection from OLD file with the direct helper check.
-    const percentQuestionIntent =
-      !!lastUserContent &&
-      (
-        /\bhow (much|many)\b/i.test(lastUserContent) ||
-        /\bwhat(?:'s| is)? the? (percent|%)/i.test(lastUserContent) ||
-        /\bhow (far|close)\b.*\b(target|goal)\b/i.test(lastUserContent) ||
-        /\bpercent\b/i.test(lastUserContent) ||
-        lastUserContent.trim().endsWith("?")
-      );
-
-    if (
-      lastUserContent &&
-      percentQuestionIntent &&
-      isPercentOfTargetQuestion(lastUserContent)
-    ) {
+    // --- 0.5) "How much percent of target" questions: backend math only ---
+    if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
       const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
       if (answer) {
-        try {
-          await saveHistoryPair({
-            supabase,
-            channel: "web",
-            userText: lastUserContent,
-            assistantText: answer,
-          });
-        } catch (e) {
-          console.error("Error saving percent answer to history:", e);
-        }
         return NextResponse.json({ reply: answer }, { status: 200 });
+      }
+    }
+
+    // --- Quick duplicate-question guard: if assistant just asked which setup and user answered with instrument, skip LLM ---
+    if (lastUserContent && lastAssistantAskedSetup(messages)) {
+      if (likelyAnswersSetupQuestion(lastUserContent)) {
+        const reply = `Got it — ${lastUserContent}. Tell me any account/risk numbers if you want quick analysis, or say "analyze" to run a check.`;
+        return NextResponse.json({ reply }, { status: 200 });
       }
     }
 
@@ -239,24 +198,6 @@ export async function POST(req: NextRequest) {
         content: m.content,
       };
     });
-
-    // --- 1.5) Load shared recent history (web + telegram) (preserve OLD behavior) ---
-    let historyMessages: { role: "user" | "assistant"; content: string }[] = [];
-    try {
-      const recentHistory = await loadRecentHistory({
-        supabase,
-        userId: "single-user",
-        limit: 10,
-      });
-
-      historyMessages = recentHistory.map((h) => ({
-        role: h.role as "user" | "assistant",
-        content: h.content,
-      }));
-    } catch (e) {
-      console.error("Error loading recent history:", e);
-      historyMessages = [];
-    }
 
     // --- 2) Build Knowledge Center context (your manual teachings) ---
     const intentTags = detectIntentTags(lastUserContent);
@@ -282,7 +223,7 @@ ${
             )
             .join("\n");
 
-    // --- 3) Profile & finance & trading profile (preserve old snippet/profile usage) ---
+    // --- 3) Build Jarvis system prompt with profile + finance + time + knowledge ---
     const displayName = profile?.display_name || "Bro";
     const bio =
       profile?.bio ||
@@ -303,40 +244,9 @@ ${
     const humor = profile?.humor_level ?? 5;
 
     const financeSnippet = buildFinanceContextSnippet(finance);
-    const tradingProfile = await loadTradingProfile(supabase);
-    const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
-    // --- 3.1) Tone engine + style preferences (from OLD file) ---
-    const toneMode = detectToneMode(lastUserContent || "", "web");
-    const toneDirective = buildToneDirective(toneMode, "web");
-
-    const styleBlock = `
-[User style preferences]
-- Call him "Bro" naturally.
-- Prefer short, clear replies unless he explicitly asks for long breakdowns or detailed step-by-step explanations.
-- Avoid sounding like a generic motivational bot. Tie everything to his actual trades, numbers, and rules.
-- When summarizing his life/rules/goals, avoid "*" star bullets unless he explicitly asks for Markdown bullets. Prefer numbered lists (1., 2., 3.) or simple dashes.
-`;
-
-    // --- 3.2) Build Jarvis system prompt (merge of OLD & NEW prompts; OLD is more detailed so preserved) ---
     const systemPrompt = `
-${toneDirective}
-${styleBlock}
-
-[Identity]
-You are Jarvis, ONE single person – his long-term trading & life companion and assistant.
-You talk to him through two doors: the web app and Telegram, but you are always
-the same Jarvis with the same memory and personality.
-
-[Emotional Safety Rule]
-If the user expresses worry, fear, regret, stress, confusion, FOMO, or panic 
-(for example: "I'm worried", "I'm scared", "I'm stressed", "I have a running trade 😢", "I feel FOMO"),
-you MUST:
-1) Acknowledge the emotion first, in a warm, short way.
-2) Stabilize with a brief reassurance (for example: "breathe", "you're okay", "one trade doesn't define you").
-3) THEN ask at most ONE focused question or offer ONE simple next step.
-4) Avoid interrogating or judging their decision while they are clearly emotional.
-5) Once they are calmer, you can shift into discipline or trading analysis if relevant.
+You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
 
 USER ID: "single-user"
 
@@ -357,7 +267,7 @@ Personality sliders (0–10):
 - Empathy: ${empathy}
 - Humor: ${humor}
 
-Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABOUT TIME):
+Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
@@ -369,8 +279,6 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABO
 
 ${financeSnippet}
 
-${tradingSnippet}
-
 USER TEACHINGS (KNOWLEDGE CENTER):
 The user has manually defined the following rules, concepts, formulas, and stories.
 These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math.
@@ -379,22 +287,20 @@ ${knowledgeSection}
 
 CONVERSATION & LISTENING:
 
-1) Short, casual replies:
-   - If the user sends a very short message ("Bro", "Ok", "Yup", etc.), respond briefly and casually, like a close friend.
-   - Do NOT start a long lecture from a one-word reply.
-
-2) If the user replies with a short negation like "no", "nope", "that's not what I meant":
+1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
    - Do NOT lecture.
    - Ask a brief clarifying question to understand exactly what they meant.
 
-3) For general trading/math questions where the server has NOT already calculated the result:
+2) For general trading/math questions where the server has NOT already calculated the result:
    - Listen carefully, restate key numbers briefly, then answer.
    - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
    - Keep coaching short and specifically tied to the numbers they gave you.
 
-4) Coaching style:
+3) Coaching style:
    - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot and trading profile memory when he talks about risk, capital, or feeling rushed.
+   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
+   - For example, remind him that a calm monthly return close to his "safe monthly return percent"
+     can already cover his living costs, so he doesn't need to gamble today.
    - Avoid generic speeches; stay tightly connected to his actual question and context.
 
 MATH & LISTENING PROTOCOL (STRICT):
@@ -410,9 +316,9 @@ MATH & LISTENING PROTOCOL (STRICT):
      "what percent", "how far from target", ALWAYS answer with the 
      raw calculation FIRST.
    - Format answers like this:
-       1. Result summary (1 line)
-       2. Tiny breakdown (1–2 lines max)
-       3. Optional coaching (1 line max)
+       • Result summary (1 line)
+       • Tiny breakdown (1–2 lines max)
+       • Then OPTIONAL coaching (1 line max)
 
 3) NEVER GUESS NUMBERS.
    - If something is unclear, ask ONE clarifying question.
@@ -437,12 +343,11 @@ MATH & LISTENING PROTOCOL (STRICT):
    (4) Optional coaching  
 
 Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules and trading profile memory as the user's personal doctrine whenever relevant.
+Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
 `.trim();
 
     const finalMessages = [
       { role: "system" as const, content: systemPrompt },
-      ...historyMessages,
       ...messagesWithTime,
     ];
 
@@ -463,18 +368,6 @@ Use the Knowledge Center rules and trading profile memory as the user's personal
             .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
             .join("\n")
         : "Sorry, I couldn't generate a response.";
-
-    // --- 5) Save latest turn into shared history (web channel) ---
-    try {
-      await saveHistoryPair({
-        supabase,
-        channel: "web",
-        userText: lastUserContent ?? null,
-        assistantText: replyContent,
-      });
-    } catch (e) {
-      console.error("Error saving chat reply to history:", e);
-    }
 
     return NextResponse.json({ reply: replyContent }, { status: 200 });
   } catch (error: unknown) {
