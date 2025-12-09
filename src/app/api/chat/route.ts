@@ -105,14 +105,31 @@ async function sendTelegramText(chatId: number | string | undefined, text: strin
         disable_web_page_preview: true,
       }),
     });
-    const json = await res.json();
-    if (!res.ok) {
-      console.error("Telegram send error:", json);
-      return { ok: false, error: json };
+
+    // always attempt to parse JSON safely
+    let json: any = null;
+    try {
+      json = await res.json();
+    } catch (parseErr) {
+      console.warn("Telegram response not JSON:", parseErr);
+      // fallback to text
+      const txt = await res.text();
+      return { ok: res.ok, error: txt || `HTTP ${res.status}` };
     }
+
+    if (!res.ok) {
+      // prefer the description field from Telegram response if available
+      const desc =
+        (json && (json.description || json.error || JSON.stringify(json))) ??
+        `HTTP ${res.status}`;
+      console.error("Telegram API returned error:", desc, json);
+      return { ok: false, error: desc, raw: json };
+    }
+
     return { ok: true, result: json };
-  } catch (err) {
+  } catch (err: any) {
     console.error("Telegram send exception:", err);
+    // err could be a network error — convert to string
     return { ok: false, error: String(err) };
   }
 }
