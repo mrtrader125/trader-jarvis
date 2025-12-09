@@ -296,12 +296,17 @@ export async function writeJournal(userId: string, message: any, source = 'jarvi
   }
 }
 
+// Add compatibility alias for older imports that expect fetchRelevantMemories
+export const fetchRelevantMemories = getRelevantMemories;
+
+// also keep default export (if present)
 export default {
   embedText,
   extractTextFromContent,
   saveMemory,
   upsertMemoryEmbedding,
   getRelevantMemories,
+  fetchRelevantMemories, // alias included
   saveConversation,
   summarizeIfNeeded,
   writeJournal,
