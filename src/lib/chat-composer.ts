@@ -3,16 +3,12 @@
  * chat-composer.ts
  *
  * Composes prompt for Jarvis, fetches memory context, and calls Groq LLM.
- * This file intentionally keeps a small shim converting options -> positional
- * arguments when calling memoryLib.getRelevantMemories so the signature stays stable.
+ * - Robust wrapper for groqClient (tries several common method names)
+ * - Uses memoryLib.getRelevantMemories (positional args)
+ * - Runs deterministic math post-processing via mathEngine
  *
  * Exports:
  *  - composeAndCallJarvis({ userId, instruction, convoHistory })
- *
- * Note: This file assumes:
- *  - '@/lib/jarvis-persona' exports buildSystemPrompt()
- *  - '@/lib/jarvis-memory' exports getRelevantMemories and fetchRelevantMemories (default export memoryLib)
- *  - '@/lib/groq' exports groqClient wrapper (or adapt as needed)
  */
 
 import { groqClient } from '@/lib/groq';
@@ -31,16 +27,46 @@ type ComposeArgs = {
 
 const DEFAULT_MEMORY_LIMIT = 6;
 
+/** Helper: resilient Groq client caller */
+async function callGroqClient(prompt: string, opts: { temperature?: number; max_tokens?: number } = {}) {
+  const anyClient = groqClient as any;
+
+  // Try common method names used by various wrappers
+  const attempts = ['call', 'request', 'generate', 'run', 'invoke', 'complete'];
+
+  for (const m of attempts) {
+    if (typeof anyClient[m] === 'function') {
+      try {
+        return await anyClient[m]({ prompt, ...opts });
+      } catch (e) {
+        // if method exists but fails, rethrow (we want the real error)
+        throw e;
+      }
+    }
+  }
+
+  // If client provides a function that accepts (prompt) directly as default export
+  if (typeof anyClient === 'function') {
+    try {
+      return await anyClient(prompt, opts);
+    } catch (e) {
+      throw e;
+    }
+  }
+
+  // Nothing matched — throw helpful error
+  throw new Error(
+    'groqClient does not expose a known call method. Expected one of: call/request/generate/run/invoke/complete or a default function. Please adapt groq client wrapper to expose a callable method.'
+  );
+}
+
 /** Build prompt from persona + memory + convo */
 async function buildPrompt(userId: string, instruction: string, convoHistory: Message[], memoryLimit = DEFAULT_MEMORY_LIMIT) {
-  // 1) system prompt
   const system = jarvisPersona.buildSystemPrompt();
 
-  // 2) fetch recent memories — positional args: (userId, tagFilter, daysRange, limit)
-  // We intentionally pass null for tagFilter and daysRange here.
+  // fetch memories (positional args: userId, tagFilter, daysRange, limit)
   const memRows = await memoryLib.getRelevantMemories(userId, null, null, memoryLimit);
 
-  // Map memories into short text chunks
   const memoryTexts = memRows.map((m: any) => {
     if (!m) return '';
     if (typeof m.content === 'string') return m.content;
@@ -51,13 +77,11 @@ async function buildPrompt(userId: string, instruction: string, convoHistory: Me
     return String(m.content ?? m.title ?? '');
   });
 
-  // 3) session history (last N messages)
   const historyText = (convoHistory || [])
     .slice(-6)
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join('\n');
 
-  // Compose final prompt
   const parts = [
     system,
     '\n\n-- Retrieved memories (most recent first) --\n' + (memoryTexts.length ? memoryTexts.join('\n---\n') : 'No relevant memory found.'),
@@ -69,42 +93,54 @@ async function buildPrompt(userId: string, instruction: string, convoHistory: Me
   return parts.join('\n\n');
 }
 
-/** Main composer: builds prompt, calls LLM, post-processes (runs math engine if required) */
-export async function composeAndCallJarvis(opts: ComposeArgs) {
-  const { userId, instruction, convoHistory = [], memoryLimit = DEFAULT_MEMORY_LIMIT } = opts;
+/** Evaluate LLM output for deterministic embedded calculations like [[calc:1+2]] */
+function postProcessLLMText(rawText: string) {
+  let text = String(rawText ?? '');
 
-  // 1) build prompt
-  const prompt = await buildPrompt(userId, instruction, convoHistory, memoryLimit);
-
-  // 2) call LLM (groqClient wrapper). Keep temperature low for deterministic answers.
-  // If your groqClient API differs, adapt the call below.
-  let llmResp: any;
-  try {
-    llmResp = await groqClient.call({
-      prompt,
-      temperature: 0.0,
-      max_tokens: 800,
-    });
-  } catch (e) {
-    throw new Error('LLM call failed: ' + String(e));
-  }
-
-  // 3) post-process: run any simple arithmetic placeholders through math engine.
-  // We look for patterns like [[calc:1+2]] and replace with deterministic result.
-  let text = String(llmResp?.text ?? llmResp?.output ?? llmResp);
-
-  // simple calc replacement: [[calc:expr]]
+  // Replace [[calc:EXPR]] with evaluated deterministic result
   text = text.replace(/\[\[calc:([^\]]+)\]\]/g, (m, expr) => {
     try {
-      const val = mathEngine.evaluateExpression(String(expr).trim());
-      return String(val);
+      const val = (mathEngine && typeof mathEngine.evaluateExpression === 'function')
+        ? mathEngine.evaluateExpression(String(expr).trim())
+        : null;
+      return val === null || val === undefined ? `[calc_error]` : String(val);
     } catch (e) {
       return `[calc_error:${String(e?.message ?? e)}]`;
     }
   });
 
-  // Build provenance (if LLM returned sources, include them)
-  const provenance = llmResp?.provenance ?? [];
+  return text;
+}
+
+/** Main composer: builds prompt, calls LLM, post-processes */
+export async function composeAndCallJarvis(opts: ComposeArgs) {
+  const { userId, instruction, convoHistory = [], memoryLimit = DEFAULT_MEMORY_LIMIT } = opts;
+
+  const prompt = await buildPrompt(userId, instruction, convoHistory, memoryLimit);
+
+  // Call Groq client using resilient wrapper
+  let llmResp: any;
+  try {
+    llmResp = await callGroqClient(prompt, { temperature: 0.0, max_tokens: 800 });
+  } catch (e) {
+    throw new Error('LLM call failed: ' + String(e?.message ?? e));
+  }
+
+  // Normalize response text
+  let text = '';
+  if (typeof llmResp === 'string') {
+    text = llmResp;
+  } else if (llmResp && typeof llmResp === 'object') {
+    // Common shapes: { text }, { output }, { choices: [{ text }] }, { result }
+    text = llmResp.text ?? llmResp.output ?? (llmResp.choices?.[0]?.text) ?? llmResp.result ?? JSON.stringify(llmResp);
+  } else {
+    text = String(llmResp);
+  }
+
+  // Post-process deterministic calculations
+  text = postProcessLLMText(text);
+
+  const provenance = llmResp?.provenance ?? llmResp?.sources ?? [];
 
   return { text, raw: llmResp, provenance };
 }
