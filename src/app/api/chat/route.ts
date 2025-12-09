@@ -177,6 +177,34 @@ function extractFirstJsonObject(text?: string | null): any | null {
   return null;
 }
 
+/** Remove the first JSON block (fenced ```json``` section or first {...}) from text and return cleaned string */
+function removeFirstJsonBlock(text?: string | null): string {
+  if (!text) return "";
+  // remove fenced block if present
+  const fenced = /```(?:json)?\n([\s\S]*?)\n```/i;
+  if (fenced.test(text)) {
+    return text.replace(fenced, "").trim();
+  }
+
+  // otherwise remove first {...} balanced block
+  const start = text.indexOf("{");
+  if (start === -1) return text.trim();
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        // remove from start to i inclusive
+        const cleaned = (text.slice(0, start) + text.slice(i + 1)).trim();
+        return cleaned;
+      }
+    }
+  }
+  return text.trim();
+}
+
 /** Main handler */
 export async function POST(req: NextRequest) {
   try {
@@ -367,6 +395,8 @@ CONVERSATION & LISTENING:
     // --- ACTION PARSING & HANDLING ---
     const maybeAction = extractFirstJsonObject(replyContent);
 
+    let actionResultSummary: string | null = null;
+
     if (maybeAction && maybeAction.action) {
       const action = maybeAction.action;
       try {
@@ -389,41 +419,65 @@ CONVERSATION & LISTENING:
           } catch (e) {
             console.error("Log notification error:", e);
           }
+
+          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${String(tg.error)}`;
         } else if (action === "schedule_reminder") {
           const time = maybeAction.time;
           const text = maybeAction.text ?? "";
           if (!time) {
             console.error("schedule_reminder missing time");
+            actionResultSummary = "Failed to schedule reminder: missing time.";
           } else {
             const saveRes = await saveReminderToSupabase(supabase, "single-user", time, text);
-            // if scheduled time is <= now, attempt immediate send and mark sent
-            try {
-              if (saveRes.ok && saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
-                const chatId = process.env.TELEGRAM_CHAT_ID;
-                const sendRes = await sendTelegramText(chatId!, text);
-                if (sendRes.ok) {
-                  await supabase
-                    .from("jarvis_reminders")
-                    .update({ status: "sent", sent_at: new Date().toISOString() })
-                    .eq("id", saveRes.data.id);
-                } else {
-                  console.error("Immediate send failed for scheduled reminder", sendRes);
+            if (saveRes.ok) {
+              actionResultSummary = `Reminder scheduled for ${time}.`;
+              // immediate send if time <= now
+              try {
+                if (saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
+                  const chatId = process.env.TELEGRAM_CHAT_ID;
+                  const sendRes = await sendTelegramText(chatId!, text);
+                  if (sendRes.ok) {
+                    await supabase
+                      .from("jarvis_reminders")
+                      .update({ status: "sent", sent_at: new Date().toISOString() })
+                      .eq("id", saveRes.data.id);
+                    actionResultSummary = `Reminder scheduled and sent immediately.`;
+                  } else {
+                    actionResultSummary = `Reminder scheduled but immediate send failed: ${String(sendRes.error)}`;
+                  }
                 }
+              } catch (e) {
+                console.error("Immediate send for scheduled reminder failed:", e);
               }
-            } catch (e) {
-              console.error("Immediate send for scheduled reminder failed:", e);
+            } else {
+              actionResultSummary = `Failed to schedule reminder: ${String(saveRes.error)}`;
             }
           }
         } else {
           console.log("Unknown action from model:", action);
+          actionResultSummary = `Unknown action: ${action}`;
         }
       } catch (e) {
         console.error("Error handling action:", e);
+        actionResultSummary = `Error executing action: ${String(e)}`;
       }
     }
 
-    // Return the assistant's full reply (may include JSON block) to the client
-    return NextResponse.json({ reply: replyContent }, { status: 200 });
+    // Remove JSON action block from assistant reply before returning to client
+    const cleanedReply = removeFirstJsonBlock(replyContent).trim();
+
+    // If cleaned reply is empty (model only returned JSON), synthesize a confirmation reply
+    let finalReplyToClient = cleanedReply;
+    if (!finalReplyToClient) {
+      if (maybeAction && maybeAction.action) {
+        finalReplyToClient = actionResultSummary || "Action executed.";
+      } else {
+        finalReplyToClient = "Okay — I did not find anything to say.";
+      }
+    }
+
+    // Return the assistant's cleaned reply to the client
+    return NextResponse.json({ reply: finalReplyToClient }, { status: 200 });
   } catch (error: unknown) {
     console.error("CHAT API ERROR:", error);
     const message = error instanceof Error ? error.message : String(error);
