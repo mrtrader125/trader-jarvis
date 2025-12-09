@@ -1,547 +1,182 @@
 // src/app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
-import { groqClient } from "@/lib/groq";
-import { getNowInfo as getNowInfoLib } from "@/lib/time"; // left in case other libs depend on it
+import { getNowInfo } from "@/lib/time";
 import {
-  isPercentOfTargetQuestion,
-  buildPercentOfTargetAnswerFromText,
-} from "@/lib/jarvis/math";
-import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
-import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
+  extractMemoryFromMessage,
+  fetchRelevantMemories,
+  saveMemoryItem,
+  shouldAskQuestion,
+  summarizeMemory,
+} from "@/lib/jarvis-memory";
+import { buildSystemPrompt } from "@/lib/jarvis/systemPrompt";
+import { getMarketStatus } from "@/lib/markets";
 
-export const runtime = "nodejs";
+// Try to import your groq client if your project exports it.
+// If not present, code falls back to an environment-based fetch adapter.
+let groqClient: any = null;
+try {
+  // adapt this path if your project uses a different export
+  // e.g. export { groqClient } from "@/lib/groq";
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const g = require("@/lib/groq");
+  groqClient = g?.groqClient || g?.default || null;
+} catch (e) {
+  groqClient = null;
+}
 
-/** Types */
-type ChatMessage = {
-  role: "system" | "user" | "assistant";
-  content: string;
-  createdAt?: string;
-  created_at?: string;
-};
+/**
+ * callLLM: unified LLM caller that uses groqClient if available,
+ * otherwise falls back to a REST call using GROQ_API_KEY (if provided).
+ *
+ * IMPORTANT:
+ * - If your project already has a `lib/groq` client, ensure it exposes `groqClient.chat.create` or modify below to use the right method.
+ * - If you use Groq PSQL or a custom wrapper, replace this function with direct calls to that wrapper.
+ */
+async function callLLM(systemPrompt: string, messages: { role: string; content: string }[]) {
+  // prefer your project's groqClient if available
+  if (groqClient && typeof groqClient.chat === "object") {
+    // many Groq SDKs expose a chat.create or similar. Try common variants:
+    if (typeof groqClient.chat.create === "function") {
+      const resp = await groqClient.chat.create({
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...messages,
+        ],
+        // Adjust params as your groq client expects (model, temperature, etc.)
+      });
+      // adapt to response shape
+      return resp?.choices?.[0]?.message?.content ?? resp?.output ?? String(resp);
+    }
+    if (typeof groqClient.chat === "function") {
+      // alternate API shape
+      const resp = await groqClient.chat({
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...messages,
+        ],
+      });
+      return resp?.choices?.[0]?.message?.content ?? resp?.output ?? String(resp);
+    }
+    // fallback: attempt a generic call
+    const resp = await groqClient.request?.({ systemPrompt, messages }) ?? null;
+    if (resp) return resp?.output ?? JSON.stringify(resp);
+  }
 
-/** Helper - builds precise timezone-aware now info for system prompt */
-function buildNowInfo(timezone: string, baseIso?: string) {
-  // baseIso optional — if provided, use that instant as "now" for reasoning
-  const reference = baseIso ? new Date(baseIso) : new Date();
+  // Fallback: call Groq REST (you must set GROQ_API_KEY in env)
+  const GROQ_API_KEY = process.env.GROQ_API_KEY;
+  const GROQ_API_URL = process.env.GROQ_API_URL || "https://api.groq.ai/v1"; // adjust if needed
+  if (!GROQ_API_KEY) {
+    throw new Error("No Groq client found and GROQ_API_KEY not set. Please add your groq client or set GROQ_API_KEY.");
+  }
 
-  // Human readable local date/time in user's timezone
-  const localeString = reference.toLocaleString("en-GB", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  const timeString = reference.toLocaleTimeString("en-GB", {
-    timeZone: timezone,
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-
-  const dateString = reference.toLocaleDateString("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }); // YYYY-MM-DD style
-
-  // Keep ISO as server UTC instant for exact reference (useful for DB)
-  const iso = reference.toISOString();
-
-  return {
-    iso,
-    timezone,
-    localeString,
-    timeString,
-    dateString,
+  // Compose a minimal request body matching common Groq REST chat endpoints
+  const payload = {
+    model: process.env.GROQ_MODEL || "gpt-4o-mini", // change to your model
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...messages,
+    ],
+    max_tokens: 1200,
+    temperature: 0.2,
   };
+
+  const res = await fetch(`${GROQ_API_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Groq API error: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  // adapt to response shape
+  return json?.choices?.[0]?.message?.content ?? json?.output ?? JSON.stringify(json);
 }
 
-/** Utility: detect simple time questions */
-function isTimeQuestion(text?: string | null) {
-  if (!text) return false;
-  const q = text.toLowerCase();
-  return (
-    q.includes("current time") ||
-    q.includes("time now") ||
-    q.includes("what's the time") ||
-    q.includes("whats the time") ||
-    q === "time?" ||
-    q === "time"
-  );
-}
-
-/** Simple intent tagger used to fetch relevant Knowledge Center blocks */
-function detectIntentTags(text?: string | null): string[] {
-  if (!text) return ["general"];
-  const q = text.toLowerCase();
-  const tags: string[] = [];
-
-  if (
-    q.includes("trade") ||
-    q.includes("trading") ||
-    q.includes("entry") ||
-    q.includes("stop loss") ||
-    q.includes("risk") ||
-    q.includes("prop firm") ||
-    q.includes("evaluation") ||
-    q.includes("chart")
-  ) {
-    tags.push("trading");
-  }
-
-  if (
-    q.includes("psychology") ||
-    q.includes("emotion") ||
-    q.includes("fear") ||
-    q.includes("revenge") ||
-    q.includes("discipline") ||
-    q.includes("tilt") ||
-    q.includes("mindset")
-  ) {
-    tags.push("psychology");
-  }
-
-  if (
-    q.includes("money") ||
-    q.includes("salary") ||
-    q.includes("expenses") ||
-    q.includes("freedom") ||
-    q.includes("runway") ||
-    q.includes("minimum required")
-  ) {
-    tags.push("money", "freedom");
-  }
-
-  if (tags.length === 0) tags.push("general");
-  return tags;
-}
-
-/** Send message to Telegram using bot token; returns { ok, result|error, raw? } with human-friendly error */
-async function sendTelegramText(chatId: number | string | undefined, text: string) {
-  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!TOKEN) {
-    console.error("Missing TELEGRAM_BOT_TOKEN");
-    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
-  }
-
-  const CHAT_ID = chatId ?? process.env.TELEGRAM_CHAT_ID;
-  if (!CHAT_ID) {
-    console.error("Missing chat id for Telegram send");
-    return { ok: false, error: "Missing chat id" };
-  }
-
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text,
-        parse_mode: "Markdown",
-        disable_web_page_preview: true,
-      }),
-    });
-
-    // parse response safely
-    let json: any = null;
-    try {
-      json = await res.json();
-    } catch (parseErr) {
-      console.warn("Telegram response not JSON:", parseErr);
-      const txt = await res.text();
-      return { ok: res.ok, error: txt || `HTTP ${res.status}` };
-    }
-
-    if (!res.ok) {
-      const desc = json?.description ?? json?.error ?? JSON.stringify(json);
-      console.error("Telegram API returned error:", desc, json);
-      return { ok: false, error: desc, raw: json };
-    }
-
-    return { ok: true, result: json, raw: json };
-  } catch (err: any) {
-    console.error("Telegram send exception:", err);
-    return { ok: false, error: String(err) };
-  }
-}
-
-/** Save reminder row to supabase */
-async function saveReminderToSupabase(
-  supabase: ReturnType<typeof createClient>,
-  userId: string,
-  sendAtIso: string,
-  message: string
-) {
-  try {
-    const payload = {
-      user_id: userId,
-      send_at: sendAtIso,
-      message,
-      status: "scheduled",
-    };
-    const { data, error } = await supabase.from("jarvis_reminders").insert([payload]).select().single();
-    if (error) {
-      console.error("Error inserting reminder:", error);
-      return { ok: false, error };
-    }
-    return { ok: true, data };
-  } catch (err) {
-    console.error("Exception saving reminder:", err);
-    return { ok: false, error: String(err) };
-  }
-}
-
-/** Extract first JSON object from text (handles fenced ```json blocks and trailing commas) */
-function extractFirstJsonObject(text?: string | null): any | null {
-  if (!text) return null;
-  const fenceMatch = text.match(/```(?:json)?\n([\s\S]*?)\n```/i);
-  let candidate = fenceMatch ? fenceMatch[1] : text;
-
-  const start = candidate.indexOf("{");
-  if (start === -1) return null;
-  let depth = 0;
-  for (let i = start; i < candidate.length; i++) {
-    const ch = candidate[i];
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        const jsonText = candidate.slice(start, i + 1);
-        try {
-          return JSON.parse(jsonText);
-        } catch (e) {
-          try {
-            const cleaned = jsonText.replace(/,(\s*[}\]])/g, "$1");
-            return JSON.parse(cleaned);
-          } catch (e2) {
-            return null;
-          }
-        }
-      }
-    }
-  }
-  return null;
-}
-
-/** Remove the first JSON block (fenced ```json``` section or first {...}) from text and return cleaned string */
-function removeFirstJsonBlock(text?: string | null): string {
-  if (!text) return "";
-  const fenced = /```(?:json)?\n([\s\S]*?)\n```/i;
-  if (fenced.test(text)) {
-    return text.replace(fenced, "").trim();
-  }
-  const start = text.indexOf("{");
-  if (start === -1) return text.trim();
-  let depth = 0;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        const cleaned = (text.slice(0, start) + text.slice(i + 1)).trim();
-        return cleaned;
-      }
-    }
-  }
-  return text.trim();
-}
-
+// -------------------- Chat Route --------------------
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const messages: ChatMessage[] = body?.messages ?? [];
+    const userId = body.userId || body.user_id || body.user?.id || "anon";
+    const timezone = body.timezone || "Asia/Kolkata";
+    const message = (body.message || body.text || "").toString();
 
-    const supabase = createClient();
+    if (!message) return NextResponse.json({ error: "No message provided" }, { status: 400 });
 
-    // --- Load profile ---
-    let profile: any = null;
-    try {
-      const { data, error } = await supabase
-        .from("jarvis_profile")
-        .select("*")
-        .eq("user_id", "single-user")
-        .single();
-
-      if (error) {
-        console.error("Error loading jarvis_profile:", error.message || error);
-      } else {
-        profile = data;
-      }
-    } catch (err) {
-      console.error("Exception loading jarvis_profile:", err);
+    // 1) extract & save memory if relevant
+    const extracted = extractMemoryFromMessage(message);
+    if (extracted) {
+      await saveMemoryItem({
+        user_id: userId,
+        type: extracted.type,
+        text: extracted.text,
+        tags: extracted.tags,
+        importance: extracted.importance,
+        timezone,
+        source: "user_message",
+      });
     }
 
-    // --- Load finance snapshot ---
-    const finance = await loadFinance(supabase);
-    const financeSnippet = buildFinanceContextSnippet(finance);
+    // 2) time & market context
+    const now = getNowInfo(timezone);
+    // Example: add market status for NSE and NYSE to prompt (helps avoid incorrect market timing)
+    const nse = getMarketStatus("NSE", timezone);
+    const nyse = getMarketStatus("NYSE", timezone);
 
-    // --- Time & last message parsing ---
-    const timezone: string = profile?.timezone || "Asia/Kolkata";
+    // 3) memory summary
+    const memorySummary = await summarizeMemory(userId, 30 * 24); // 30 days
 
-    const lastMessage = messages[messages.length - 1];
-    const lastUserContent = lastMessage?.role === "user" ? lastMessage.content : undefined;
-
-    // Use the timestamp from the user's last message if present (createdAt or created_at)
-    const lastSentIso = lastMessage ? lastMessage.createdAt || lastMessage.created_at || undefined : undefined;
-
-    // Build a precise nowInfo (if lastSentIso provided, use that instant for 'now' in reasoning)
-    const nowInfo = buildNowInfo(timezone, lastSentIso);
-
-    // 0) time question handled server-side
-    if (isTimeQuestion(lastUserContent)) {
-      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      return NextResponse.json({ reply }, { status: 200 });
-    }
-
-    // 0.5) percent-of-target math handled server-side
-    if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
-      const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
-      if (answer) {
-        return NextResponse.json({ reply: answer }, { status: 200 });
+    // 4) simple smalltalk detection -> repetition prevention
+    const lower = message.toLowerCase();
+    if (/(how are you|how's your day|how is your day|how are you doing)/i.test(lower)) {
+      const repeatCheck = await shouldAskQuestion(userId, "how_are_you", 24);
+      if (!repeatCheck.shouldAsk) {
+        const replyText = `You previously said: "${repeatCheck.lastAnswer}". Do you want to update that or talk about something else?`;
+        return NextResponse.json({ reply: replyText, skippedLLM: true });
       }
     }
 
-    // 1) tag user messages with [sent_at: ...]
-    const messagesWithTime = messages.map((m) => {
-      const sentAt = m.createdAt || m.created_at || new Date().toISOString();
-      if (m.role === "user") {
-        return {
-          role: m.role,
-          content: `[sent_at: ${sentAt}] ${m.content}`,
-        };
-      }
-      return { role: m.role, content: m.content };
-    });
+    // 5) build system prompt (includes memory summary & time)
+    const systemPrompt = buildSystemPrompt({
+      now,
+      memorySummary,
+      lastAnswersForQuestions: {},
+    }) + `
 
-    // 2) Knowledge Center
-    const intentTags = detectIntentTags(lastUserContent);
-    const knowledgeBlocks = await buildKnowledgeContext({
-      intentTags,
-      maxItems: 8,
-    });
+Market quick-check:
+- NSE: ${nse.market?.name ?? "unknown"} — open: ${nse.open ? "YES" : "NO"} (market local: ${nse.marketTimeHuman}, user time: ${nse.userTimeHuman})
+- NYSE: ${nyse.market?.name ?? "unknown"} — open: ${nyse.open ? "YES" : "NO"} (market local: ${nyse.marketTimeHuman}, user time: ${nyse.userTimeHuman})
 
-    const knowledgeSection =
-      knowledgeBlocks.length === 0
-        ? "No explicit user knowledge has been defined yet."
-        : knowledgeBlocks
-            .map(
-              (b) => `
-### ${b.title} [${b.item_type}, importance ${b.importance}]
-${b.content}
+Instruction: Use the above market status for any market-timing statements. If you are unsure, say "I don't have live market hours for that exchange" rather than guessing.
+`;
 
-${b.instructions ? `How Jarvis must use this:\n${b.instructions}\n` : ""}`
-            )
-            .join("\n");
-
-    // 3) Build system prompt (includes server-action rules)
-    const displayName = profile?.display_name || "Bro";
-    const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
-    const mainGoal = profile?.main_goal || "Become a consistently profitable, rule-based trader.";
-    const currentFocus = profile?.current_focus || "Discipline over profits.";
-
-    const typicalWake = profile?.typical_wake_time || "06:30";
-    const typicalSleep = profile?.typical_sleep_time || "23:30";
-    const sessionStart = profile?.trading_session_start || "09:15";
-    const sessionEnd = profile?.trading_session_end || "15:30";
-
-    const strictness = profile?.strictness_level ?? 8;
-    const empathy = profile?.empathy_level ?? 7;
-    const humor = profile?.humor_level ?? 5;
-
-    const systemPrompt = `
-You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
-You are allowed to instruct the server to perform actions (send Telegram messages, schedule reminders).
-When you need the server to perform an action, output a single JSON object (no other text in the same JSON block). Example:
-
-\`\`\`json
-{
-  "action": "send_telegram",
-  "chat_id": 123456789,
-  "text": "Bro — quick reminder: check your daily limits."
-}
-\`\`\`
-
-Rules:
-- The model should produce the JSON object only when it truly intends to trigger a server action.
-- If both conversational reply and action are needed, prefer returning a short assistant message followed by a separate JSON action block.
-- The server will parse the first JSON object it finds and execute it.
-
-USER ID: "single-user"
-
-User identity:
-- Name you call him: ${displayName}
-- Bio: ${bio}
-- Main goal: ${mainGoal}
-- Current focus: ${currentFocus}
-
-User routine:
-- Timezone: ${timezone}
-- Typical wake time: ${typicalWake}
-- Typical sleep time: ${typicalSleep}
-- Trading session: ${sessionStart} - ${sessionEnd}
-
-Personality sliders (0–10):
-- Strictness: ${strictness}
-- Empathy: ${empathy}
-- Humor: ${humor}
-
-Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
-- ISO: ${nowInfo.iso}
-- Local: ${nowInfo.localeString}
-- Timezone: ${nowInfo.timezone}
-- TimeString: ${nowInfo.timeString}
-- DateString: ${nowInfo.dateString}
-
-[sent_at: ...] TAGS:
-- User messages may start with [sent_at: ISO_DATE] at the front.
-- This is metadata only. Use it to infer how long it's been since the last message.
-- NEVER print the [sent_at: ...] tag or raw ISO timestamps back to the user.
-
-${financeSnippet}
-
-USER TEACHINGS (KNOWLEDGE CENTER):
-${knowledgeSection}
-
-CONVERSATION & LISTENING:
-- Be strict but caring.
-- ALWAYS extract numbers and compute before coaching.
-- For "send to Telegram" or "remind me at ..." requests, produce a JSON action object as shown above.
-`.trim();
-
-    const finalMessages = [
-      { role: "system" as const, content: systemPrompt },
-      ...messagesWithTime,
+    // 6) compose messages (you should include recent history in production)
+    const messages = [
+      { role: "user", content: message },
     ];
 
-    // 4) Call Groq LLM
-    const completion = await groqClient.chat.completions.create({
-      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      messages: finalMessages,
-      stream: false,
+    // 7) call LLM
+    const assistantText = await callLLM(systemPrompt, messages);
+
+    // 8) save assistant reply optionally
+    await saveMemoryItem({
+      user_id: userId,
+      type: "assistant_reply",
+      text: assistantText,
+      tags: ["assistant_reply"],
+      importance: 1,
+      timezone,
+      source: "assistant",
     });
 
-    const replyMessage = completion.choices?.[0]?.message as any;
-
-    const replyContent =
-      typeof replyMessage?.content === "string"
-        ? replyMessage.content
-        : Array.isArray(replyMessage?.content)
-        ? replyMessage.content.map((c: any) => (typeof c === "string" ? c : c.text ?? "")).join("\n")
-        : "Sorry, I couldn't generate a response.";
-
-    // --- ACTION PARSING & HANDLING ---
-    const maybeAction = extractFirstJsonObject(replyContent);
-
-    let actionResultSummary: string | null = null;
-
-    if (maybeAction && maybeAction.action) {
-      const action = maybeAction.action;
-      try {
-        if (action === "send_telegram") {
-          const text: string = maybeAction.text ?? "";
-          const chatId = maybeAction.chat_id ?? process.env.TELEGRAM_CHAT_ID;
-          const tg = await sendTelegramText(chatId, text);
-
-          // log to supabase (optional telemetry)
-          try {
-            await supabase.from("jarvis_notifications").insert([
-              {
-                user_id: "single-user",
-                type: "telegram",
-                payload: { action: "send_telegram", chat_id: chatId, text },
-                result: tg,
-                created_at: new Date().toISOString(),
-              },
-            ]);
-          } catch (e) {
-            console.error("Log notification error:", e);
-          }
-
-          const tgError = tg.error;
-          const tgErrorMsg =
-            typeof tgError === "string"
-              ? tgError
-              : tgError && typeof tgError === "object"
-              ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
-              : String(tgError);
-
-          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
-        } else if (action === "schedule_reminder") {
-          const time = maybeAction.time;
-          const text = maybeAction.text ?? "";
-          if (!time) {
-            console.error("schedule_reminder missing time");
-            actionResultSummary = "Failed to schedule reminder: missing time.";
-          } else {
-            const saveRes = await saveReminderToSupabase(supabase, "single-user", time, text);
-            if (saveRes.ok) {
-              actionResultSummary = `Reminder scheduled for ${time}.`;
-              // immediate send if time <= now
-              try {
-                if (saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
-                  const chatId = process.env.TELEGRAM_CHAT_ID;
-                  const sendRes = await sendTelegramText(chatId!, text);
-                  if (sendRes.ok) {
-                    await supabase
-                      .from("jarvis_reminders")
-                      .update({ status: "sent", sent_at: new Date().toISOString() })
-                      .eq("id", saveRes.data.id);
-                    actionResultSummary = `Reminder scheduled and sent immediately.`;
-                  } else {
-                    const sendErr = sendRes.error;
-                    const sendErrMsg =
-                      typeof sendErr === "string"
-                        ? sendErr
-                        : sendErr && typeof sendErr === "object"
-                        ? (sendErr.description ?? sendErr.error ?? JSON.stringify(sendErr))
-                        : String(sendErr);
-                    actionResultSummary = `Reminder scheduled but immediate send failed: ${sendErrMsg}`;
-                  }
-                }
-              } catch (e) {
-                console.error("Immediate send for scheduled reminder failed:", e);
-              }
-            } else {
-              actionResultSummary = `Failed to schedule reminder: ${String(saveRes.error)}`;
-            }
-          }
-        } else {
-          console.log("Unknown action from model:", action);
-          actionResultSummary = `Unknown action: ${action}`;
-        }
-      } catch (e) {
-        console.error("Error handling action:", e);
-        actionResultSummary = `Error executing action: ${String(e)}`;
-      }
-    }
-
-    // Remove JSON action block from assistant reply before returning to client
-    const cleanedReply = removeFirstJsonBlock(replyContent).trim();
-
-    // If cleaned reply is empty (model only returned JSON), synthesize a confirmation reply
-    let finalReplyToClient = cleanedReply;
-    if (!finalReplyToClient) {
-      if (maybeAction && maybeAction.action) {
-        finalReplyToClient = actionResultSummary || "Action executed.";
-      } else {
-        finalReplyToClient = "Okay — I did not find anything to say.";
-      }
-    }
-
-    // Return the assistant's cleaned reply to the client
-    return NextResponse.json({ reply: finalReplyToClient }, { status: 200 });
-  } catch (error: unknown) {
-    console.error("CHAT API ERROR:", error);
-    const message = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ reply: "Jarvis brain crashed: " + message }, { status: 200 });
+    return NextResponse.json({ reply: assistantText });
+  } catch (err: any) {
+    console.error("chat route error", err);
+    return NextResponse.json({ error: String(err?.message || err) }, { status: 500 });
   }
 }
