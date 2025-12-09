@@ -1,313 +1,247 @@
 // src/lib/jarvis-memory.ts
-// Memory engine using Groq embeddings by default.
-// Full replacement — drop into src/lib and replace previous file.
+/**
+ * jarvis-memory.ts
+ *
+ * Lightweight Supabase-based memory helpers for Jarvis.
+ * - Provides getRelevantMemories (supports signature used in summarizer)
+ * - Provides saveConversation, writeJournal, saveMemory, upsertMemoryEmbedding, embedText stub
+ * - Exports fetchRelevantMemories as an alias for backwards compatibility
+ *
+ * NOTE: This file is intentionally dependency-light and uses the project's
+ * Supabase server client factory at "@/lib/supabase/server".
+ */
 
 import { createClient } from '@/lib/supabase/server';
-import { groqClient } from '@/lib/groq';
 
-const supabase = createClient();
-
-type MemoryType = 'rule' | 'preference' | 'fact' | 'event' | 'trade_snapshot' | 'note';
-
-export interface JarvisMemory {
-  id?: string;
+// Types
+export type MemoryRow = {
+  id: string;
   user_id: string;
-  type: MemoryType;
-  title: string;
-  content: any;
-  embedding?: number[] | null;
+  type?: string;
+  title?: string;
+  content?: any;
+  embedding?: any;
   importance?: number;
   tags?: string[];
-  status?: 'active' | 'archived';
+  status?: string;
   created_at?: string;
   updated_at?: string;
-}
+};
 
-/**
- * embedText: uses groqClient.embed(...) to produce embedding vectors.
- * - Model name here is 'embed-1536' as placeholder; change if your Groq account uses another name.
- * - The function returns a number[] embedding suitable for storing in Supabase vector column.
- */
-export async function embedText(text: string): Promise<number[]> {
-  if (!text || !text.trim()) throw new Error('embedText: empty text');
-
-  // Primary: use groqClient.embed if available
-  try {
-    if (!groqClient || typeof (groqClient as any).embed !== 'function') {
-      throw new Error('groqClient.embed not available');
-    }
-
-    const resp = await (groqClient as any).embed({
-      model: 'embed-1536', // change if your Groq embedding model name differs
-      input: text,
-    });
-
-    // Common response shapes handled:
-    // - { data: [{ embedding: [...] }, ...] }
-    // - { embedding: [...] }
-    if (resp?.data && Array.isArray(resp.data) && resp.data[0]?.embedding) {
-      return resp.data[0].embedding;
-    }
-    if (Array.isArray(resp) && resp[0]?.embedding) {
-      return resp[0].embedding;
-    }
-    if (resp?.embedding) {
-      return resp.embedding;
-    }
-
-    throw new Error('embed response missing embedding');
-  } catch (err: any) {
-    console.error('embedText (groq) failed:', err?.message ?? err);
-    throw new Error('Embedding failed (groq). Check groqClient and model name.');
-  }
-}
-
-/**
- * extractTextFromContent: Pulls readable text from JSON content for embedding generation.
- * Keeps input sizes reasonable by trimming to 8192 chars.
- */
-export function extractTextFromContent(content: any): string {
-  if (!content) return '';
-  if (typeof content === 'string') return content.slice(0, 8192);
-  try {
-    const strings: string[] = [];
-    const stack: any[] = [content];
-
-    while (stack.length) {
-      const cur = stack.pop();
-      if (!cur) continue;
-      if (typeof cur === 'string') {
-        strings.push(cur);
-        continue;
-      }
-      if (Array.isArray(cur)) {
-        for (let i = cur.length - 1; i >= 0; --i) stack.push(cur[i]);
-        continue;
-      }
-      if (typeof cur === 'object') {
-        for (const k of Object.keys(cur)) {
-          const v = cur[k];
-          if (typeof v === 'string') strings.push(v);
-          else stack.push(v);
-        }
-      }
-      if (strings.join(' ').length > 8000) break;
-    }
-
-    const joined = strings.join(' ').replace(/\s+/g, ' ').trim();
-    return joined.slice(0, 8192);
-  } catch (e) {
-    return JSON.stringify(content).slice(0, 8192);
-  }
-}
-
-/**
- * saveMemory: inserts a memory into the memories table.
- * - will compute embedding using Groq if not provided.
- * - returns inserted row on success.
- */
-export async function saveMemory(mem: JarvisMemory) {
-  try {
-    const contentText = extractTextFromContent(mem.content);
-    const embedding = mem.embedding ?? (contentText ? await embedText(contentText) : null);
-
-    const row = {
-      user_id: mem.user_id,
-      type: mem.type,
-      title: mem.title,
-      content: mem.content,
-      embedding: embedding ?? null,
-      importance: mem.importance ?? 1,
-      tags: mem.tags ?? [],
-      status: mem.status ?? 'active',
-    };
-
-    const { data, error } = await supabase.from('memories').insert(row).select().single();
-    if (error) {
-      console.error('saveMemory supabase error:', error);
-      return { error };
-    }
-    return { data };
-  } catch (err) {
-    console.error('saveMemory exception:', err);
-    return { error: err };
-  }
-}
-
-/**
- * upsertMemoryEmbedding: update embedding for an existing memory id.
- */
-export async function upsertMemoryEmbedding(memoryId: string, embedding: number[]) {
-  try {
-    const { data, error } = await supabase
-      .from('memories')
-      .update({ embedding })
-      .eq('id', memoryId)
-      .select()
-      .single();
-    if (error) {
-      console.error('upsertMemoryEmbedding error:', error);
-      return { error };
-    }
-    return { data };
-  } catch (err) {
-    console.error('upsertMemoryEmbedding exception:', err);
-    return { error: err };
-  }
-}
-
-/**
- * getRelevantMemories: uses RPC match_memories if embedding provided or can be created.
- * - Accepts userId and either queryEmbedding or queryText.
- * - Falls back to a simple textual search if embedding or RPC fails.
- */
-export async function getRelevantMemories({
-  userId,
-  queryText,
-  queryEmbedding,
-  limit = 6,
-}: {
-  userId: string;
-  queryText?: string;
-  queryEmbedding?: number[] | null;
-  limit?: number;
-}) {
-  try {
-    // If caller provided embedding, prefer RPC
-    if (queryEmbedding && Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
-      const { data, error } = await supabase
-        .rpc('match_memories', { p_user_id: userId, p_query_embedding: queryEmbedding, p_limit: limit });
-      if (!error && data) return { data };
-      console.warn('match_memories RPC returned error:', error);
-    }
-
-    // If queryText exists, generate embedding via Groq and call RPC
-    if (queryText && queryText.trim()) {
-      try {
-        const emb = await embedText(queryText);
-        const { data, error } = await supabase
-          .rpc('match_memories', { p_user_id: userId, p_query_embedding: emb, p_limit: limit });
-        if (!error && data) return { data };
-        console.warn('match_memories after emb error:', error);
-      } catch (e) {
-        console.warn('embedding for search failed:', (e as Error).message ?? e);
-      }
-    }
-
-    // final fallback: text search on title/content
-    if (queryText && queryText.trim()) {
-      const { data, error } = await supabase
-        .from('memories')
-        .select('id, title, content, importance, tags, created_at, updated_at')
-        .ilike('title', `%${queryText}%`)
-        .or(`content::text.ilike.%${queryText}%`)
-        .limit(limit);
-      if (!error && data) return { data };
-      console.warn('fallback text search error:', error);
-      return { data: [] };
-    }
-
-    // default: return recent high importance memories for user
-    const { data, error } = await supabase
-      .from('memories')
-      .select('id, title, content, importance, tags, created_at, updated_at')
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .order('importance', { ascending: false })
-      .limit(limit);
-    if (!error && data) return { data };
-    return { data: [] };
-  } catch (err) {
-    console.error('getRelevantMemories exception:', err);
-    return { error: err };
-  }
-}
-
-/**
- * saveConversation: store session-level conversation snapshots
- * - attempts to embed summary/messages when possible
- */
-export async function saveConversation({
-  userId,
-  messages,
-  summary,
-  embedding,
-}: {
-  userId: string;
-  messages: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[];
+export type ConversationRow = {
+  id?: string;
+  user_id: string;
+  messages: any[];
   summary?: string;
-  embedding?: number[] | null;
-}) {
+  last_active?: string;
+  embedding?: any;
+  created_at?: string;
+  updated_at?: string;
+};
+
+// Helper to get Supabase server client (wrap to keep portability)
+function supabaseClient() {
+  return createClient();
+}
+
+/**
+ * embedText
+ * - Placeholder embedding function. Replace with your embedding provider call.
+ * - Returns a vector (array of numbers) or null if embedding not available.
+ */
+export async function embedText(text: string): Promise<number[] | null> {
+  // Placeholder: if you have an embeddings provider, call it here and return vector.
+  // e.g., call OpenAI/your-embed-service and return vector numbers.
+  // For now, return null to indicate embeddings are not present.
   try {
-    const summaryText = summary ?? messages.map(m => `${m.role}: ${m.content}`).join('\n').slice(0, 8000);
-    const emb = embedding ?? (summaryText ? await embedText(summaryText) : null);
-
-    const row = {
-      user_id: userId,
-      messages,
-      summary: summaryText,
-      embedding: emb ?? null,
-      last_active: new Date().toISOString(),
-    };
-
-    const { data, error } = await supabase.from('conversations').insert(row).select().single();
-    if (error) {
-      console.error('saveConversation error:', error);
-      return { error };
-    }
-    return { data };
-  } catch (err) {
-    console.error('saveConversation exception:', err);
-    return { error: err };
+    if (!text) return null;
+    // Minimal deterministic fallback: hash characters to small vector (not for real similarity)
+    const v = new Array(8).fill(0).map((_, i) => (text.charCodeAt(i % text.length) || 0) % 100 / 100);
+    return v;
+  } catch (e) {
+    console.warn('embedText fallback failed:', e);
+    return null;
   }
 }
 
 /**
- * summarizeIfNeeded: light wrapper using Groq to summarize long text; fallback to truncation
+ * saveMemory
+ * Insert a memory row into 'memories' table (or update if id provided).
  */
-export async function summarizeIfNeeded(text: string, maxLen = 800) {
-  if (!text || text.length <= maxLen) return text;
+export async function saveMemory(userId: string, memory: Partial<MemoryRow>) {
+  const supabase = supabaseClient();
+  const row = {
+    user_id: userId,
+    type: memory.type ?? 'fact',
+    title: memory.title ?? null,
+    content: memory.content ?? null,
+    importance: memory.importance ?? 1,
+    tags: memory.tags ?? [],
+    status: memory.status ?? 'active',
+  };
+
   try {
-    if (groqClient && typeof (groqClient as any).complete === 'function') {
-      const prompt = `Summarize the following text into 1-3 concise sentences, keeping facts and timestamps:\n\n${text}`;
-      const resp = await (groqClient as any).complete({
-        prompt,
-        temperature: 0.0,
-        max_tokens: 200,
-      });
-      const summary = resp?.choices?.[0]?.text ?? resp?.output ?? null;
-      if (summary) return String(summary).trim().slice(0, maxLen);
+    const { data, error } = await supabase.from('memories').insert(row).select().single();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    console.warn('saveMemory error:', e);
+    throw e;
+  }
+}
+
+/**
+ * upsertMemoryEmbedding
+ * Update a memory row with embedding vector (assumes memory row id exists).
+ */
+export async function upsertMemoryEmbedding(memoryId: string, embedding: any) {
+  const supabase = supabaseClient();
+  try {
+    const { data, error } = await supabase.from('memories').update({ embedding }).eq('id', memoryId).select().single();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    console.warn('upsertMemoryEmbedding error:', e);
+    throw e;
+  }
+}
+
+/**
+ * getRelevantMemories
+ * Returns recent relevant memories for a user.
+ *
+ * Signature supports:
+ *  - userId: string
+ *  - tagFilter?: string[] | null
+ *  - daysRange?: number | null  (number of days to look back; if null -> no time filter)
+ *  - limit?: number (max rows to return)
+ *
+ * This implementation uses simple filters (tags contains & created_at >= since).
+ */
+export async function getRelevantMemories(
+  userId: string,
+  tagFilter: string[] | null = null,
+  daysRange: number | null = null,
+  limit: number = 50
+): Promise<MemoryRow[]> {
+  const supabase = supabaseClient();
+
+  try {
+    let query = supabase
+      .from('memories')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (tagFilter && Array.isArray(tagFilter) && tagFilter.length > 0) {
+      // uses Postgres array/JSON contains; adjust if your schema differs
+      query = query.contains('tags', tagFilter);
     }
-  } catch (e) {
-    console.warn('summarizeIfNeeded groq failed:', (e as Error).message ?? e);
-  }
-  return text.slice(0, maxLen) + '...';
-}
 
-/** Simple journal write helper */
-export async function writeJournal(userId: string, message: any, source = 'jarvis-memory') {
-  try {
-    const { data, error } = await supabase.from('journal').insert({ user_id: userId, message, source }).select().single();
-    if (error) console.warn('writeJournal error:', error);
-    return { data, error };
+    if (daysRange && typeof daysRange === 'number') {
+      const since = new Date(Date.now() - daysRange * 24 * 60 * 60 * 1000).toISOString();
+      query = query.gte('created_at', since);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    return (data as MemoryRow[]) || [];
   } catch (e) {
-    console.error('writeJournal exception:', e);
-    return { error: e };
+    console.warn('getRelevantMemories error:', e);
+    return [];
   }
 }
 
-// Add compatibility alias for older imports that expect fetchRelevantMemories
+// Backwards-compatible alias expected by older code
 export const fetchRelevantMemories = getRelevantMemories;
 
-// also keep default export (if present)
+/**
+ * saveConversation
+ * Save a conversation snapshot to conversations table.
+ */
+export async function saveConversation(row: ConversationRow) {
+  const supabase = supabaseClient();
+  const payload = {
+    user_id: row.user_id,
+    messages: row.messages ?? [],
+    summary: row.summary ?? null,
+    last_active: row.last_active ?? new Date().toISOString(),
+    embedding: row.embedding ?? null,
+  };
+
+  try {
+    const { data, error } = await supabase.from('conversations').insert(payload).select().single();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    console.warn('saveConversation error:', e);
+    throw e;
+  }
+}
+
+/**
+ * summarizeIfNeeded
+ * Placeholder summarizer: produces a short summary if messages exceed threshold.
+ * Replace with real LLM summarization or retriever as needed.
+ */
+export async function summarizeIfNeeded(conversation: ConversationRow): Promise<string | null> {
+  try {
+    const text = (conversation.messages ?? []).map((m: any) => `${m.role}: ${m.content}`).join('\n');
+    if (text.length < 800) return null;
+    // Very small heuristic summary (first 300 chars)
+    return text.slice(0, 300) + (text.length > 300 ? '...' : '');
+  } catch (e) {
+    console.warn('summarizeIfNeeded error:', e);
+    return null;
+  }
+}
+
+/**
+ * writeJournal
+ * Write an audit log to the `journal` table.
+ */
+export async function writeJournal(userId: string, message: any, source: string | null = null) {
+  const supabase = supabaseClient();
+  try {
+    const row = {
+      user_id: userId ?? 'unknown',
+      message,
+      source: source ?? 'app',
+    };
+    const { data, error } = await supabase.from('journal').insert(row).select().single();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    console.warn('writeJournal error:', e);
+    return null;
+  }
+}
+
+/**
+ * Utility: getMemoryById
+ */
+export async function getMemoryById(memoryId: string) {
+  const supabase = supabaseClient();
+  try {
+    const { data, error } = await supabase.from('memories').select('*').eq('id', memoryId).single();
+    if (error) throw error;
+    return data as MemoryRow;
+  } catch (e) {
+    console.warn('getMemoryById error:', e);
+    return null;
+  }
+}
+
+// Default export for compatibility with earlier code that expects default object
 export default {
   embedText,
-  extractTextFromContent,
   saveMemory,
   upsertMemoryEmbedding,
   getRelevantMemories,
-  fetchRelevantMemories, // alias included
+  fetchRelevantMemories,
   saveConversation,
   summarizeIfNeeded,
   writeJournal,
+  getMemoryById,
 };
