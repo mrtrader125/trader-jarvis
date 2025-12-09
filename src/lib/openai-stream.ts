@@ -1,25 +1,38 @@
 // src/lib/openai-stream.ts
-// Simple, robust wrapper: call OpenAI Chat Completions (non-streaming) and return a ReadableStream
-// that emits a single SSE-like chunk. This avoids streaming incompatibilities during build/runtime.
-// Adjust `OPENAI_API_BASE` if you use a different host.
+// Groq-compatible chat wrapper. Replaces previous OpenAI wrapper.
+// - Uses Groq's OpenAI-compatible REST endpoint: https://api.groq.com/openai/v1/chat/completions
+// - Exposes streamOpenAIResponse(messages, opts) and returns a ReadableStream that emits a single data event.
+// - If you prefer the official groq-sdk, we can switch to that later.
 
-export async function streamOpenAIResponse(messages: { role: string; content: string }[], opts?: { userId?: string }) {
-  const OPENAI_KEY = process.env.OPENAI_API_KEY;
-  if (!OPENAI_KEY) throw new Error("Missing OPENAI_API_KEY env var");
+export async function streamOpenAIResponse(
+  messages: { role: string; content: string }[],
+  opts?: { userId?: string; model?: string }
+) {
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) throw new Error("Missing GROQ_API_KEY env var");
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  // Use an env override for model name; fall back to OPENAI_MODEL for compatibility
+  const model = opts?.model || process.env.OPENAI_MODEL || process.env.GROQ_MODEL || "llama3-70b-8192";
+
+  // Groq supports an OpenAI-compatible endpoint base at api.groq.com/openai.
+  // Note: some deployments may want a different base (set GROQ_BASE_URL).
+  const base = process.env.GROQ_BASE_URL || "https://api.groq.com/openai";
+  const url = `${base}/v1/chat/completions`;
+
   const body = {
     model,
     messages,
-    temperature: 0.1,
-    max_tokens: 1000,
     user: opts?.userId,
+    temperature: Number(process.env.GROQ_TEMPERATURE ?? 0.1),
+    max_tokens: Number(process.env.GROQ_MAX_TOKENS ?? 1000),
+    // If you later want streaming true, switch to stream: true and implement SSE parsing.
+    stream: false,
   };
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
+      Authorization: `Bearer ${GROQ_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -27,18 +40,20 @@ export async function streamOpenAIResponse(messages: { role: string; content: st
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`OpenAI API error: ${res.status} ${txt}`);
+    throw new Error(`Groq API error: ${res.status} ${txt}`);
   }
 
   const json = await res.json();
-  // Attempt to extract assistant content
-  const content = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? JSON.stringify(json);
+  // Extract assistant text (OpenAI-compatible response shape)
+  const content =
+    json?.choices?.[0]?.message?.content ??
+    json?.choices?.[0]?.text ??
+    JSON.stringify(json);
 
-  // Create a ReadableStream that emits a single SSE-like 'data:' event then closes.
-  const stream = new ReadableStream({
+  // Return a ReadableStream that emits a single SSE-like data event (keeps compatibility with existing route)
+  return new ReadableStream({
     start(controller) {
       try {
-        // Emit a single data event: client-side SSE parser or your client can read and parse this.
         const payload = `data: ${JSON.stringify({ delta: content })}\n\n`;
         controller.enqueue(new TextEncoder().encode(payload));
         controller.close();
@@ -47,6 +62,4 @@ export async function streamOpenAIResponse(messages: { role: string; content: st
       }
     },
   });
-
-  return stream;
 }
