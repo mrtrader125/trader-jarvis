@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { groqClient } from "@/lib/groq";
-import { getNowInfo } from "@/lib/time";
+import { getNowInfo as getNowInfoLib } from "@/lib/time";
 import {
   isPercentOfTargetQuestion,
   buildPercentOfTargetAnswerFromText,
@@ -25,6 +25,47 @@ type TelegramUpdate = {
     date?: number;
   };
 };
+
+/** Helper - builds precise timezone-aware now info for system prompt */
+function buildNowInfo(timezone: string, baseIso?: string) {
+  const reference = baseIso ? new Date(baseIso) : new Date();
+
+  const localeString = reference.toLocaleString("en-GB", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const timeString = reference.toLocaleTimeString("en-GB", {
+    timeZone: timezone,
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const dateString = reference.toLocaleDateString("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const iso = reference.toISOString();
+
+  return {
+    iso,
+    timezone,
+    localeString,
+    timeString,
+    dateString,
+  };
+}
 
 function isTimeQuestion(text?: string | null) {
   if (!text) return false;
@@ -106,8 +147,7 @@ function parseChatId(candidate: any): number | null {
   return null;
 }
 
-/** Sends simple text message to Telegram (safe error extraction)
- *  This expects a numeric chatId (validated) */
+/** Sends simple text message to Telegram (safe error extraction) */
 async function sendTelegramText(chatId: number, text: string) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
@@ -316,6 +356,7 @@ export async function POST(req: NextRequest) {
 
     const chatId = message.chat.id;
     const userText = message.text;
+    // Use message.date (unix seconds) as precise sentAt when available
     const sentAtIso = new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
 
     const supabase = createClient();
@@ -353,7 +394,8 @@ export async function POST(req: NextRequest) {
     const financeSnippet = buildFinanceContextSnippet(finance);
 
     const timezone: string = profile?.timezone || "Asia/Kolkata";
-    const nowInfo = getNowInfo(timezone);
+    // Build nowInfo using the message timestamp so Jarvis reasons with exact message time
+    const nowInfo = buildNowInfo(timezone, sentAtIso);
 
     const displayName = profile?.display_name || "Bro";
     const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
@@ -373,7 +415,6 @@ export async function POST(req: NextRequest) {
     if (isTimeQuestion(userText)) {
       const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
-      // use numeric chatId that came with update
       const chatNum = parseChatId(chatId);
       if (chatNum) await sendTelegramText(chatNum, reply);
       const audio = await synthesizeTTS(reply);
@@ -447,6 +488,8 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
+- TimeString: ${nowInfo.timeString}
+- DateString: ${nowInfo.dateString}
 
 [sent_at: ...] TAG:
 - The user text may be wrapped as:
