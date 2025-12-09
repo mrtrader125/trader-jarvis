@@ -89,56 +89,43 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
-/** Sends simple text message to Telegram */
-async function sendTelegramText(chatId: number | string | undefined, text: string) {
-  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!TOKEN) {
+/** Sends simple text message to Telegram (safe error extraction) */
+async function sendTelegramText(chatId: number, text: string) {
+  if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
     return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
   }
 
-  const CHAT_ID = chatId ?? process.env.TELEGRAM_CHAT_ID;
-  if (!CHAT_ID) {
-    console.error("Missing chat id for Telegram send");
-    return { ok: false, error: "Missing chat id" };
-  }
-
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: CHAT_ID,
+        chat_id: chatId,
         text,
         parse_mode: "Markdown",
         disable_web_page_preview: true,
       }),
     });
 
-    // always attempt to parse JSON safely
     let json: any = null;
     try {
       json = await res.json();
     } catch (parseErr) {
       console.warn("Telegram response not JSON:", parseErr);
-      // fallback to text
       const txt = await res.text();
       return { ok: res.ok, error: txt || `HTTP ${res.status}` };
     }
 
     if (!res.ok) {
-      // prefer the description field from Telegram response if available
-      const desc =
-        (json && (json.description || json.error || JSON.stringify(json))) ??
-        `HTTP ${res.status}`;
+      const desc = json?.description ?? json?.error ?? JSON.stringify(json);
       console.error("Telegram API returned error:", desc, json);
       return { ok: false, error: desc, raw: json };
     }
 
-    return { ok: true, result: json };
+    return { ok: true, result: json, raw: json };
   } catch (err: any) {
-    console.error("Telegram send exception:", err);
-    // err could be a network error — convert to string
+    console.error("sendTelegramText exception:", err);
     return { ok: false, error: String(err) };
   }
 }
@@ -165,10 +152,24 @@ async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
       headers: form.getHeaders ? form.getHeaders() : undefined,
     });
 
-    const json = await res.json();
-    return { ok: res.ok, result: json };
+    let json: any = null;
+    try {
+      json = await res.json();
+    } catch (parseErr) {
+      console.warn("Telegram voice response not JSON:", parseErr);
+      const txt = await res.text();
+      return { ok: res.ok, error: txt || `HTTP ${res.status}` };
+    }
+
+    if (!res.ok) {
+      const desc = json?.description ?? JSON.stringify(json);
+      console.error("Telegram sendVoice error:", desc, json);
+      return { ok: false, error: desc, raw: json };
+    }
+
+    return { ok: true, result: json, raw: json };
   } catch (err: any) {
-    console.error("sendTelegramVoice error:", err);
+    console.error("sendTelegramVoice exception:", err);
     return { ok: false, error: String(err) };
   }
 }
@@ -469,9 +470,18 @@ CONVERSATION & LISTENING (TELEGRAM):
           const text: string = maybeAction.text ?? "";
           const chatTarget = maybeAction.chat_id ?? chatId;
           const tg = await sendTelegramText(chatTarget, text);
-          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${String(tg.error)}`;
 
-          // optional logging (non-blocking)
+          const tgError = tg.error;
+          const tgErrorMsg =
+            typeof tgError === "string"
+              ? tgError
+              : tgError && typeof tgError === "object"
+              ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
+              : String(tgError);
+
+          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
+
+          // non-blocking log
           (async () => {
             try {
               await supabase.from("jarvis_notifications").insert([
