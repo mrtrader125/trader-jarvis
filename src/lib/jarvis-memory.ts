@@ -2,17 +2,19 @@
 /**
  * jarvis-memory.ts
  *
- * Exports:
- *  - named exports: embedText, saveMemory, upsertMemoryEmbedding, getRelevantMemories,
- *    fetchRelevantMemories, saveConversation, summarizeIfNeeded, writeJournal, getMemoryById
- *  - default export: memoryLib (object with the same functions) for modules that import default
+ * Centralized Supabase memory helpers for Jarvis.
+ * - Named exports + explicit default export (memoryLib) for compatibility
+ * - Provides: embedText, saveMemory, upsertMemoryEmbedding, getRelevantMemories,
+ *   fetchRelevantMemories (compat wrapper), saveConversation, summarizeIfNeeded,
+ *   writeJournal, getMemoryById
+ * - New: buildPromptWithMemory(userId, instruction, convoHistory, memoryLimit)
+ *         returns { prompt: string, memories: MemoryRow[] }
  *
- * Uses Supabase server client at "@/lib/supabase/server".
+ * NOTE: Replace placeholder embedText with your actual embedding provider.
  */
 
 import { createClient } from '@/lib/supabase/server';
 
-// Types
 export type MemoryRow = {
   id: string;
   user_id: string;
@@ -43,7 +45,7 @@ function supabaseClient() {
   return createClient();
 }
 
-/** embedText: placeholder embedding - returns small deterministic vector or null */
+/** embedText - placeholder deterministic small vector fallback */
 export async function embedText(text: string): Promise<number[] | null> {
   try {
     if (!text) return null;
@@ -92,8 +94,8 @@ export async function upsertMemoryEmbedding(memoryId: string, embedding: any) {
 }
 
 /**
- * getRelevantMemories
- * Return MemoryRow[] filtered by userId, optional tagFilter, optional daysRange (days), and limit
+ * getRelevantMemories(userId, tagFilter|null, daysRange|null, limit)
+ * Returns MemoryRow[]
  */
 export async function getRelevantMemories(
   userId: string,
@@ -130,8 +132,8 @@ export async function getRelevantMemories(
 }
 
 /**
- * fetchRelevantMemories (compatibility wrapper)
- * Returns items shaped for summarizer: { id?, text: string, type?: string }[]
+ * fetchRelevantMemories (compat wrapper)
+ * Returns items: { id?, text: string, type?: string }[]
  */
 export async function fetchRelevantMemories(
   userId: string,
@@ -156,7 +158,7 @@ export async function fetchRelevantMemories(
   });
 }
 
-/** saveConversation: normalize userId/user_id and persist */
+/** saveConversation: normalize userId/user_id */
 export async function saveConversation(row: ConversationRow) {
   const supabase = supabaseClient();
   const userId = (row.userId ?? row.user_id ?? 'unknown') as string;
@@ -179,7 +181,7 @@ export async function saveConversation(row: ConversationRow) {
   }
 }
 
-/** summarizeIfNeeded */
+/** summarizeIfNeeded: simple heuristic (replace with LLM summarizer) */
 export async function summarizeIfNeeded(conversation: ConversationRow): Promise<string | null> {
   try {
     const text = (conversation.messages ?? []).map((m: any) => `${m.role}: ${m.content}`).join('\n');
@@ -223,8 +225,60 @@ export async function getMemoryById(memoryId: string) {
 }
 
 /**
- * Build explicit default object to satisfy default imports (and keep parity with named exports)
+ * buildPromptWithMemory
+ * - Fetches recent memories and composes a combined system+memory+history prompt string.
+ * - Returns { prompt, memories } so caller can persist provenance if needed.
+ *
+ * Parameters:
+ *  - userId: string
+ *  - instruction: string (user instruction or query)
+ *  - convoHistory: array of messages (optional) [{ role, content, ts }]
+ *  - memoryLimit: number (how many memories to fetch)
  */
+export async function buildPromptWithMemory(
+  userId: string,
+  instruction: string,
+  convoHistory: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[] = [],
+  memoryLimit: number = 6
+): Promise<{ prompt: string; memories: MemoryRow[] }> {
+  // Load persona/system prompt from jarvis-persona if available (do not import here to avoid circulars)
+  // Many callers will already add persona; to be safe, include a minimal header.
+  const personaHeader = `SYSTEM: JARVIS — concise, competent, mildly witty. Use stored memory when relevant. For numeric calcs use deterministic math engine.`;
+
+  // 1) fetch memory rows (positional args)
+  const memories = await getRelevantMemories(userId, null, null, memoryLimit);
+
+  // 2) map to readable memory text
+  const memoryTexts = memories.map((m) => {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (m.title && !m.content) return String(m.title);
+    if (m.content && typeof m.content === 'object') {
+      return m.content.text ?? m.content.body ?? m.content.note ?? m.title ?? JSON.stringify(m.content);
+    }
+    return String(m.content ?? m.title ?? '');
+  });
+
+  // 3) session history snippet
+  const historyText = (convoHistory || [])
+    .slice(-6)
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join('\n');
+
+  // 4) compose final prompt
+  const parts = [
+    personaHeader,
+    '\n\n-- Retrieved memories (most recent first) --\n' + (memoryTexts.length ? memoryTexts.join('\n---\n') : 'No relevant memories found.'),
+    '\n\n-- Recent session --\n' + (historyText || 'No recent messages.'),
+    '\n\n-- User instruction --\n' + instruction,
+    '\n\n-- Rules --\n- Always route numeric calculations to the deterministic math engine.\n- If fact is not in memory, ask to run a check or say you don\'t have the info.\n- Provide provenance when asserting facts (memory id or snapshot).',
+  ];
+
+  const prompt = parts.join('\n\n');
+  return { prompt, memories };
+}
+
+/** Explicit default object for compatibility (default import) */
 export const memoryLib = {
   embedText,
   saveMemory,
@@ -235,7 +289,7 @@ export const memoryLib = {
   summarizeIfNeeded,
   writeJournal,
   getMemoryById,
+  buildPromptWithMemory,
 };
 
-// Named exports already provided above; ensure default export exists too
 export default memoryLib;
