@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { groqClient } from "@/lib/groq";
-import { getNowInfo } from "@/lib/time";
+import { getNowInfo as getNowInfoLib } from "@/lib/time"; // left in case other libs depend on it
 import {
   isPercentOfTargetQuestion,
   buildPercentOfTargetAnswerFromText,
@@ -19,6 +19,50 @@ type ChatMessage = {
   createdAt?: string;
   created_at?: string;
 };
+
+/** Helper - builds precise timezone-aware now info for system prompt */
+function buildNowInfo(timezone: string, baseIso?: string) {
+  // baseIso optional — if provided, use that instant as "now" for reasoning
+  const reference = baseIso ? new Date(baseIso) : new Date();
+
+  // Human readable local date/time in user's timezone
+  const localeString = reference.toLocaleString("en-GB", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const timeString = reference.toLocaleTimeString("en-GB", {
+    timeZone: timezone,
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const dateString = reference.toLocaleDateString("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }); // YYYY-MM-DD style
+
+  // Keep ISO as server UTC instant for exact reference (useful for DB)
+  const iso = reference.toISOString();
+
+  return {
+    iso,
+    timezone,
+    localeString,
+    timeString,
+    dateString,
+  };
+}
 
 /** Utility: detect simple time questions */
 function isTimeQuestion(text?: string | null) {
@@ -80,34 +124,17 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
-/** Helper: parse numeric chat id candidates safely */
-function parseChatId(candidate: any): number | null {
-  if (candidate === null || candidate === undefined) return null;
-  if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
-  if (typeof candidate === "string") {
-    const trimmed = candidate.trim();
-    if (/^-?\d+$/.test(trimmed)) {
-      try {
-        return Number(trimmed);
-      } catch {
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
-/** Send message to Telegram using bot token; returns { ok, result|error, raw? } with human-friendly error
- *  NOTE: this function expects a numeric chatId (validated) to avoid "chat not found" errors */
-async function sendTelegramText(chatIdNum: number, text: string) {
+/** Send message to Telegram using bot token; returns { ok, result|error, raw? } with human-friendly error */
+async function sendTelegramText(chatId: number | string | undefined, text: string) {
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   if (!TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
     return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
   }
 
-  if (!chatIdNum && chatIdNum !== 0) {
-    console.error("Missing numeric chat id for Telegram send");
+  const CHAT_ID = chatId ?? process.env.TELEGRAM_CHAT_ID;
+  if (!CHAT_ID) {
+    console.error("Missing chat id for Telegram send");
     return { ok: false, error: "Missing chat id" };
   }
 
@@ -116,7 +143,7 @@ async function sendTelegramText(chatIdNum: number, text: string) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: chatIdNum,
+        chat_id: CHAT_ID,
         text,
         parse_mode: "Markdown",
         disable_web_page_preview: true,
@@ -228,7 +255,6 @@ function removeFirstJsonBlock(text?: string | null): string {
   return text.trim();
 }
 
-/** Main handler */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -260,10 +286,15 @@ export async function POST(req: NextRequest) {
 
     // --- Time & last message parsing ---
     const timezone: string = profile?.timezone || "Asia/Kolkata";
-    const nowInfo = getNowInfo(timezone);
 
     const lastMessage = messages[messages.length - 1];
     const lastUserContent = lastMessage?.role === "user" ? lastMessage.content : undefined;
+
+    // Use the timestamp from the user's last message if present (createdAt or created_at)
+    const lastSentIso = lastMessage ? lastMessage.createdAt || lastMessage.created_at || undefined : undefined;
+
+    // Build a precise nowInfo (if lastSentIso provided, use that instant for 'now' in reasoning)
+    const nowInfo = buildNowInfo(timezone, lastSentIso);
 
     // 0) time question handled server-side
     if (isTimeQuestion(lastUserContent)) {
@@ -339,16 +370,6 @@ When you need the server to perform an action, output a single JSON object (no o
 }
 \`\`\`
 
-or
-
-\`\`\`json
-{
-  "action": "schedule_reminder",
-  "time": "2025-12-09T10:00:00.000Z",
-  "text": "Reminder: close trades and review risk."
-}
-\`\`\`
-
 Rules:
 - The model should produce the JSON object only when it truly intends to trigger a server action.
 - If both conversational reply and action are needed, prefer returning a short assistant message followed by a separate JSON action block.
@@ -377,6 +398,8 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
+- TimeString: ${nowInfo.timeString}
+- DateString: ${nowInfo.dateString}
 
 [sent_at: ...] TAGS:
 - User messages may start with [sent_at: ISO_DATE] at the front.
@@ -425,52 +448,33 @@ CONVERSATION & LISTENING:
       try {
         if (action === "send_telegram") {
           const text: string = maybeAction.text ?? "";
+          const chatId = maybeAction.chat_id ?? process.env.TELEGRAM_CHAT_ID;
+          const tg = await sendTelegramText(chatId, text);
 
-          // NEW: resolve chat target safely (prefer numeric model chat_id, then profile, then env)
-          const modelCandidate = maybeAction.chat_id ?? null;
-          let chatTarget = parseChatId(modelCandidate);
-
-          if (!chatTarget && profile?.telegram_chat_id) {
-            chatTarget = parseChatId(profile.telegram_chat_id);
+          // log to supabase (optional telemetry)
+          try {
+            await supabase.from("jarvis_notifications").insert([
+              {
+                user_id: "single-user",
+                type: "telegram",
+                payload: { action: "send_telegram", chat_id: chatId, text },
+                result: tg,
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          } catch (e) {
+            console.error("Log notification error:", e);
           }
 
-          if (!chatTarget && process.env.TELEGRAM_CHAT_ID) {
-            chatTarget = parseChatId(process.env.TELEGRAM_CHAT_ID);
-          }
+          const tgError = tg.error;
+          const tgErrorMsg =
+            typeof tgError === "string"
+              ? tgError
+              : tgError && typeof tgError === "object"
+              ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
+              : String(tgError);
 
-          if (!chatTarget) {
-            // fail gracefully — do not call Telegram with invalid id
-            actionResultSummary =
-              "Failed to send: no valid chat id found. Open the bot in Telegram and press Start so Jarvis can message you, or set TELEGRAM_CHAT_ID in env.";
-          } else {
-            // call sendTelegramText with numeric chat id
-            const tg = await sendTelegramText(Number(chatTarget), text);
-
-            // log to supabase (optional telemetry)
-            try {
-              await supabase.from("jarvis_notifications").insert([
-                {
-                  user_id: "single-user",
-                  type: "telegram",
-                  payload: { action: "send_telegram", chat_id: chatTarget, text },
-                  result: tg,
-                  created_at: new Date().toISOString(),
-                },
-              ]);
-            } catch (e) {
-              console.error("Log notification error:", e);
-            }
-
-            const tgError = tg.error;
-            const tgErrorMsg =
-              typeof tgError === "string"
-                ? tgError
-                : tgError && typeof tgError === "object"
-                ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
-                : String(tgError);
-
-            actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
-          }
+          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
         } else if (action === "schedule_reminder") {
           const time = maybeAction.time;
           const text = maybeAction.text ?? "";
@@ -484,28 +488,23 @@ CONVERSATION & LISTENING:
               // immediate send if time <= now
               try {
                 if (saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
-                  const chatIdEnv = process.env.TELEGRAM_CHAT_ID;
-                  const chatIdNum = parseChatId(chatIdEnv);
-                  if (chatIdNum) {
-                    const sendRes = await sendTelegramText(chatIdNum, text);
-                    if (sendRes.ok) {
-                      await supabase
-                        .from("jarvis_reminders")
-                        .update({ status: "sent", sent_at: new Date().toISOString() })
-                        .eq("id", saveRes.data.id);
-                      actionResultSummary = `Reminder scheduled and sent immediately.`;
-                    } else {
-                      const sendErr = sendRes.error;
-                      const sendErrMsg =
-                        typeof sendErr === "string"
-                          ? sendErr
-                          : sendErr && typeof sendErr === "object"
-                          ? (sendErr.description ?? sendErr.error ?? JSON.stringify(sendErr))
-                          : String(sendErr);
-                      actionResultSummary = `Reminder scheduled but immediate send failed: ${sendErrMsg}`;
-                    }
+                  const chatId = process.env.TELEGRAM_CHAT_ID;
+                  const sendRes = await sendTelegramText(chatId!, text);
+                  if (sendRes.ok) {
+                    await supabase
+                      .from("jarvis_reminders")
+                      .update({ status: "sent", sent_at: new Date().toISOString() })
+                      .eq("id", saveRes.data.id);
+                    actionResultSummary = `Reminder scheduled and sent immediately.`;
                   } else {
-                    actionResultSummary = `Reminder scheduled but immediate send skipped: no valid chat id in env.`;
+                    const sendErr = sendRes.error;
+                    const sendErrMsg =
+                      typeof sendErr === "string"
+                        ? sendErr
+                        : sendErr && typeof sendErr === "object"
+                        ? (sendErr.description ?? sendErr.error ?? JSON.stringify(sendErr))
+                        : String(sendErr);
+                    actionResultSummary = `Reminder scheduled but immediate send failed: ${sendErrMsg}`;
                   }
                 }
               } catch (e) {
