@@ -1,4 +1,11 @@
 // src/app/api/telegram/processPending/route.ts
+/**
+ * Worker to import telegram webhook raw journal rows into telegram_updates,
+ * process pending updates, call Jarvis composer, send replies, and mark processed.
+ *
+ * Protected by X-JARVIS-KEY header (JARVIS_API_KEY env).
+ */
+
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
@@ -9,15 +16,11 @@ const supabase = createClient();
 
 export const runtime = 'nodejs';
 
-// === CONFIG ===
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? null;
 const TELEGRAM_API_BASE = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : null;
-
-// API key to protect this worker (set in Vercel envs)
 const JARVIS_API_KEY = process.env.JARVIS_API_KEY ?? null;
-if (!JARVIS_API_KEY) console.warn('JARVIS_API_KEY not set — processPending endpoint will be inaccessible without header.');
 
-// Helper: send Telegram message
+/** Helper to send a Telegram text message */
 async function sendTelegramMessage(chatId: number | string, text: string, replyToMessageId?: number) {
   if (!TELEGRAM_API_BASE) throw new Error('TELEGRAM_BOT_TOKEN not configured');
   const url = `${TELEGRAM_API_BASE}/sendMessage`;
@@ -32,7 +35,7 @@ async function sendTelegramMessage(chatId: number | string, text: string, replyT
   return json;
 }
 
-// Import raw journal rows into telegram_updates table (idempotent)
+/** Import raw journal rows into telegram_updates table (idempotent) */
 async function importFromJournal(limit = 50) {
   try {
     const { data: rawRows, error: rawErr } = await supabase
@@ -51,7 +54,6 @@ async function importFromJournal(limit = 50) {
         const updateId = update?.update_id ?? (update?.message?.message_id ? Number(update.message.message_id) : null);
         if (!updateId) continue;
 
-        // Use upsert-like behavior: ignore duplicates
         try {
           await supabase
             .from('telegram_updates')
@@ -62,9 +64,7 @@ async function importFromJournal(limit = 50) {
               source: 'journal_import',
             });
         } catch (insertErr: any) {
-          // If unique constraint violation occurs, ignore
-          // supabase-js older versions may throw — safe to ignore duplicates
-          // console.warn('insert error (likely duplicate):', insertErr?.message ?? insertErr);
+          // ignore duplicates / unique constraint errors
         }
         imported += 1;
       } catch (e) {
@@ -105,6 +105,7 @@ async function markProcessed(id: string) {
   }
 }
 
+/** Process a single update: call Jarvis, send reply, save conversation/journal, mark processed */
 async function processUpdate(row: any) {
   const payload = row.payload;
   const updateId = row.update_id;
@@ -112,23 +113,37 @@ async function processUpdate(row: any) {
   const messageId = payload?.message?.message_id ?? null;
   const userId = String(row.user_id ?? chatId ?? 'telegram_unknown');
 
+  // extract text if available
   let text = payload?.message?.text ?? null;
+
+  // NOTE: this worker currently does NOT support voice->STT conversion.
   if (!text) {
     await supabase.from('journal').insert({ user_id: userId, message: { event: 'no_text_in_pending', update: payload }, source: 'processPending' });
     await markProcessed(row.id);
     return { ok: false, reason: 'no_text' };
   }
 
-  const convoHistory = [{ role: 'user', content: text, ts: new Date().toISOString() }];
+  // Build convoHistory with a single user message and strongly-typed local type
+  type LocalMessage = { role: 'user' | 'assistant' | 'system'; content: string; ts?: string };
+  const convoHistory: LocalMessage[] = [
+    {
+      role: 'user',
+      content: String(text),
+      ts: new Date().toISOString(),
+    },
+  ];
 
-  // 1) Call composer
+  // 1) Call Jarvis composer
   let jarvisResp;
   try {
-    jarvisResp = await composeLib.composeAndCallJarvis({
+    // Build payload as `any` to avoid strict structural checking at call site.
+    const callPayload: any = {
       userId,
       instruction: text,
-      convoHistory,
-    });
+      convoHistory: convoHistory,
+    };
+
+    jarvisResp = await composeLib.composeAndCallJarvis(callPayload);
   } catch (e) {
     await supabase.from('journal').insert({ user_id: userId, message: { event: 'compose_error', error: String(e?.message ?? e), payload }, source: 'processPending' });
     return { ok: false, reason: 'compose_error', error: String(e?.message ?? e) };
@@ -138,15 +153,15 @@ async function processUpdate(row: any) {
   try {
     await memoryLib.saveConversation({
       userId,
-      messages: convoHistory.concat([{ role: 'assistant', content: jarvisResp?.text ?? '' }]),
-      summary: `${text.slice(0, 400)}\n\nJARVIS: ${(jarvisResp?.text ?? '').slice(0, 800)}`,
-    });
+      messages: convoHistory.concat([{ role: 'assistant', content: jarvisResp?.text ?? '', ts: new Date().toISOString() }]),
+      summary: `${String(text).slice(0, 400)}\n\nJARVIS: ${(jarvisResp?.text ?? '').slice(0, 800)}`,
+    } as any);
     await memoryLib.writeJournal(userId, { event: 'telegram_processed', update_id: updateId, provenance: jarvisResp?.provenance ?? [] }, 'processPending');
   } catch (e) {
     console.warn('saveConversation/writeJournal failed:', e);
   }
 
-  // 3) Send reply
+  // 3) Send reply to Telegram
   try {
     const safeText = String(jarvisResp?.text ?? 'Jarvis is awake, but had nothing to say.');
     if (TELEGRAM_API_BASE) {
@@ -157,11 +172,12 @@ async function processUpdate(row: any) {
     return { ok: false, reason: 'send_failed', error: String(e?.message ?? e) };
   }
 
+  // 4) Mark processed
   await markProcessed(row.id);
   return { ok: true };
 }
 
-// ========== MAIN ENTRY ==========
+/** Main handler: import journal rows (if needed), process a batch, return summary */
 export async function POST(req: NextRequest) {
   // Protect endpoint with API key (x-jarvis-key)
   const incomingKey = req.headers.get('x-jarvis-key') ?? req.headers.get('x-jarvis-key'.toLowerCase());
