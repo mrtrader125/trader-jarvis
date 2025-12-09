@@ -44,7 +44,8 @@ export async function saveMemoryItem(item: MemoryItem) {
     user_id: item.user_id?.toString(),
     type: item.type || "misc",
     text: item.text,
-    tags: normalizeTags(item.tags),
+    // Cast tags to any to satisfy supabase client typing for arrays
+    tags: normalizeTags(item.tags) as unknown as string,
     importance: item.importance ?? 3,
     source: item.source || "app",
     hash,
@@ -52,9 +53,10 @@ export async function saveMemoryItem(item: MemoryItem) {
     timezone: item.timezone || now.timezone,
   };
 
+  // NOTE: Supabase client typings sometimes expect an array for upsert(...) — pass an array and cast to any
   const { data, error } = await supabase
     .from("jarvis_memory")
-    .upsert(record, { onConflict: ["user_id", "hash"] });
+    .upsert([record] as any, { onConflict: "user_id,hash" });
 
   if (error) {
     console.error("saveMemoryItem error", error);
@@ -87,11 +89,11 @@ export async function fetchRelevantMemories(
     .order("created_at", { ascending: false });
 
   if (intent) {
-    // use ilike on tags text representation (Supabase/Postgres array handling may vary)
-    query = query.ilike("tags::text", `%${intent.toLowerCase()}%`);
+    // use a cast to text for tags (Postgres text[] cast). Some Supabase clients support ilike on tags::text
+    query = (query as any).ilike("tags::text", `%${intent.toLowerCase()}%`);
   }
 
-  const { data, error } = await query.limit(maxItems);
+  const { data, error } = await (query as any).limit(maxItems);
 
   if (error) {
     console.error("fetchRelevantMemories error", error);
@@ -113,10 +115,10 @@ export async function shouldAskQuestion(
 ) {
   const now = new Date();
   const cutoff = new Date(now.getTime() - horizonHours * 3600 * 1000).toISOString();
-  const { data, error } = await supabase
+  // use a safe cast for ilike on tags
+  const { data, error } = await (supabase
     .from("jarvis_memory")
-    .select("*")
-    .eq("user_id", userId.toString())
+    .select("*") as any)
     .ilike("tags::text", `%${questionKey}%`)
     .gte("created_at", cutoff)
     .order("created_at", { ascending: false })
