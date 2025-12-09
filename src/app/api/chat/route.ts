@@ -11,7 +11,27 @@ import { buildSystemPrompt } from "@/lib/jarvis/systemPrompt";
 import { getMarketStatus } from "@/lib/markets";
 import callLLM from "@/lib/llm";
 import extractMemoryWithLLM from "@/lib/memory-extractor-llm";
-import summarizeItemsWithLLM from "@/lib/memory-summarizer";
+
+const MEMORY_SUMMARY_TRIGGER = Number(process.env.MEMORY_SUMMARY_TRIGGER || 120);
+const JOBS_SUMMARY_ENDPOINT = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}/api/jobs/summarize`
+  : process.env.JOBS_SUMMARY_ENDPOINT || `http://localhost:3000/api/jobs/summarize`;
+
+/**
+ * fire-and-forget helper to trigger background job endpoint.
+ */
+function triggerBackgroundSummarizer(payload?: any) {
+  // best-effort: do not await; log errors
+  fetch(JOBS_SUMMARY_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload ? JSON.stringify(payload) : undefined,
+  }).then((r) => {
+    if (!r.ok) console.warn("background summarizer returned not ok", r.status);
+  }).catch((err) => {
+    console.warn("background summarizer trigger failed", err);
+  });
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -21,11 +41,9 @@ export async function POST(req: NextRequest) {
     const message = (body.message || body.text || "").toString();
     if (!message) return NextResponse.json({ error: "No message provided" }, { status: 400 });
 
-    // 1) LLM-based extraction (preferred) with fallback to heuristic extractor in jarvis-memory if desired
+    // 1) extract memory with LLM extractor
     let extracted = null;
-    try {
-      extracted = await extractMemoryWithLLM(message, userId);
-    } catch (e) { console.warn("extractor LLM failed, falling back"); extracted = null; }
+    try { extracted = await extractMemoryWithLLM(message, userId); } catch (e) { extracted = null; }
 
     if (extracted && extracted.shouldSave) {
       await saveMemoryItem({
@@ -39,26 +57,21 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2) Time & market context
+    // 2) time & market
     const now = getNowInfo(timezone);
     const nse = getMarketStatus("NSE", timezone);
     const nyse = getMarketStatus("NYSE", timezone);
 
-    // 3) memory summary (prefer LLM summarizer when memory count large)
-    const memorySummary = await summarizeMemory(userId, 30 * 24); // existing fast summarizer
-    // if memorySummary.count > threshold, run LLM summarizer to produce compact summary and persist
-    if ((memorySummary?.count || 0) > 120) {
-      // fetch the raw recent items to summarize (use fetchRelevantMemories)
-      const recent = await fetchRelevantMemories(userId, null, 30 * 24, 200);
-      await summarizeItemsWithLLM({ userId, items: recent, persist: true });
-      // re-run light summarizer to get updated summary for prompt
-      // (you can also fetch the new summary from DB; simpler to call summarizeMemory again)
-      // Note: this is synchronous; consider moving to background job if too heavy.
+    // 3) fetch light memory summary for prompt
+    const memorySummary = await summarizeMemory(userId, 30 * 24);
+
+    // 4) if memory count large, trigger background summarizer (fire-and-forget)
+    if ((memorySummary?.count || 0) > MEMORY_SUMMARY_TRIGGER) {
+      // optionally include single-user run to speed up
+      triggerBackgroundSummarizer({ users: [userId] });
     }
 
-    const updatedMemorySummary = await summarizeMemory(userId, 30 * 24);
-
-    // 4) repetition prevention for smalltalk
+    // 5) repetition prevention for smalltalk
     const lower = message.toLowerCase();
     if (/(how are you|how's your day|how is your day|how are you doing)/i.test(lower)) {
       const repeatCheck = await shouldAskQuestion(userId, "how_are_you", 24);
@@ -68,10 +81,10 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 5) build system prompt with memory and market info
+    // 6) build prompt + market info
     const systemPrompt = buildSystemPrompt({
       now,
-      memorySummary: updatedMemorySummary,
+      memorySummary,
       lastAnswersForQuestions: {},
     }) + `
 Market quick-check:
@@ -81,15 +94,14 @@ Market quick-check:
 Instruction: Use the above market status for any market-timing statements. If you are unsure, say "I don't have live market hours for that exchange" rather than guessing.
 `;
 
-    // 6) compile messages; include last few messages if your UI sends them in body
+    // 7) build messages and call LLM
     const messages = body.history && Array.isArray(body.history) && body.history.length > 0
       ? body.history.map((m: any) => ({ role: m.role, content: m.content }))
       : [{ role: "user", content: message }];
 
-    // 7) call LLM
     const assistantText = await callLLM(systemPrompt, messages);
 
-    // 8) save assistant reply to memory (low importance)
+    // 8) save assistant reply
     await saveMemoryItem({
       user_id: userId,
       type: "assistant_reply",
