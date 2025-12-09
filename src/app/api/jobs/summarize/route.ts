@@ -6,48 +6,47 @@ import summarizeItemsWithLLM from "@/lib/memory-summarizer";
 
 const supabase = createClient();
 
-// Config
+// Config (tune these via env)
 const MEMORY_COUNT_THRESHOLD = Number(process.env.MEMORY_SUMMARY_THRESHOLD || 120);
 const BATCH_LIMIT = Number(process.env.MEMORY_SUMMARY_BATCH_LIMIT || 50); // Users processed per run
+const ROW_FETCH_LIMIT = Number(process.env.MEMORY_SUMMARY_ROW_FETCH_LIMIT || 10000); // rows to fetch for aggregation
 
 /**
- * Helper: find user ids that have memory count above threshold.
- * Returns array of user_id strings.
+ * findUsersNeedingSummary(threshold, limit)
+ * - Safe typed implementation that fetches up to ROW_FETCH_LIMIT rows from jarvis_memory
+ *   and aggregates counts client-side to find users with counts > threshold.
+ *
+ * Note: This is simpler and typesafe for serverless builds. If your table grows very large,
+ * consider replacing with an optimized SQL aggregate run inside Supabase (SQL function).
  */
 async function findUsersNeedingSummary(threshold: number, limit = 50) {
-  // We run a grouped query: count per user_id
-  const sql = `
-    select user_id, count(*) as cnt
-    from public.jarvis_memory
-    group by user_id
-    having count(*) > ${threshold}
-    order by cnt desc
-    limit ${limit};
-  `;
-  const { data, error } = await supabase.rpc("sql", { q: sql }).catch(async () => {
-    // If your supabase doesn't allow rpc SQL helper, fall back to a simpler approach:
-    const { data: rows, error: e } = await supabase
-      .from("jarvis_memory")
-      .select("user_id, count:id", { count: "estimated" })
-      .limit(limit);
-    if (e) throw e;
-    return { data: rows || [] };
-  });
+  // Fetch user_id for recent rows (up to ROW_FETCH_LIMIT)
+  const { data: rows, error } = await supabase
+    .from("jarvis_memory")
+    .select("user_id")
+    .limit(ROW_FETCH_LIMIT);
 
   if (error) {
-    console.error("findUsersNeedingSummary SQL error", error);
+    console.error("findUsersNeedingSummary fetch error", error);
     return [];
   }
+  if (!rows || rows.length === 0) return [];
 
-  // Data shape depends on query path; normalize
-  const users = (data || []).map((r: any) => {
-    if (r.user_id) return r.user_id.toString();
-    // fallback
-    return String(r[Object.keys(r)[0]]);
-  });
+  // Aggregate counts client-side
+  const counts: Record<string, number> = {};
+  for (const r of rows) {
+    const uid = (r as any).user_id ? String((r as any).user_id) : "unknown";
+    counts[uid] = (counts[uid] || 0) + 1;
+  }
 
-  // Deduplicate and return
-  return Array.from(new Set(users)).slice(0, limit);
+  // Filter users above threshold, sort by count desc and return up to `limit`
+  const users = Object.entries(counts)
+    .filter(([_, cnt]) => cnt > threshold)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([uid]) => uid);
+
+  return users;
 }
 
 /**
