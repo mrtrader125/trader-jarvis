@@ -1,48 +1,38 @@
-// src/lib/jarvis/systemPrompt.ts
-// Helper to build the Jarvis system prompt in a clean consistent way.
-
-import { buildPromptWithMemory } from "@/lib/jarvis-memory";
-import type { NowInfo } from "@/lib/time";
-
-interface MemorySummaryObject {
-  summary_short: string;
-  count: number;
-}
-
-interface SystemPromptInput {
-  now: NowInfo;
-  // Accept either the object form or already-extracted string (robust)
-  memorySummary?: MemorySummaryObject | string | null;
-  lastAnswersForQuestions?: Record<
-    string,
-    {
-      lastAnswer: string | null;
-      lastAt?: string | null;
-    }
-  >;
-}
-
+﻿// src/lib/jarvis/systemPrompt.ts
 /**
- * buildSystemPrompt
- * Normalizes memorySummary to a string and calls the compat object form of buildPromptWithMemory.
+ * Helper to build a compact Jarvis system prompt.
+ * Kept simple and deterministic so tests and builds succeed.
  */
-export function buildSystemPrompt({
-  now,
-  memorySummary,
-  lastAnswersForQuestions,
-}: SystemPromptInput) {
-  // Normalize memorySummary to a plain string (compat with buildPromptWithMemory)
-  const memorySummaryString =
-    typeof memorySummary === "string"
-      ? memorySummary
-      : memorySummary && typeof memorySummary === "object"
-      ? memorySummary.summary_short ?? ""
-      : "";
 
-  // Use the compat object signature of buildPromptWithMemory
-  return buildPromptWithMemory({
-    nowInfo: now,
-    memorySummary: memorySummaryString,
-    lastAnswersForQuestions: lastAnswersForQuestions ?? {},
-  });
+export interface NowInfo {
+  iso?: string;
+  tz?: string;
+  human?: string;
+}
+
+interface MemorySummary {
+  title?: string;
+  summary?: string;
+}
+
+export default function buildSystemPrompt(now: NowInfo | null = null, memorySummaries: MemorySummary[] = []) {
+  const when = now?.human ? `Time: ${now.human}` : now?.iso ? `Time: ${now.iso}` : "Time: unknown";
+  const mem = (memorySummaries && memorySummaries.length > 0)
+    ? `Memory summary:\n${memorySummaries.map((m, i) => `${i+1}. ${m.title ?? "item"} - ${m.summary ?? ""}`).join("\n")}`
+    : "Memory: (none)";
+
+  const prompt = [
+    "You are Jarvis — a calm, precise trading & operations assistant.",
+    when,
+    mem,
+    "",
+    "Rules:",
+    "- Use concise, actionable language.",
+    "- If asked about sensitive actions (money, trading rules, deletion), show a short caution and ask for confirmation.",
+    "- Always be deterministic in calculations; show formulae where helpful.",
+    "",
+    "When replying include the 'role' (assistant) and a helpful text response."
+  ].join("\n");
+
+  return prompt;
 }

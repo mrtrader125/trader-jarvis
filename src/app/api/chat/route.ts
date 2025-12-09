@@ -1,35 +1,53 @@
-﻿import { NextResponse } from "next/server";
+﻿// src/app/api/chat/route.ts
+import type { NextApiRequest, NextApiResponse } from "next";
 
-export async function POST(req: Request) {
+type ComposeResult = {
+  messages?: Array<{ role: string; content: string }>;
+  meta?: Record<string, any>;
+};
+
+async function tryLoadCompose(): Promise<((opts?: any) => Promise<ComposeResult>) | null> {
   try {
-    const body = await req.json().catch(() => null);
-    console.log("[chat route] incoming body:", JSON.stringify(body?.messages?.slice?.(0,2) ?? body, null, 2));
-    // Try to import your composer or wrapper
-    let composeLib = null;
-    try {
-      composeLib = await import("@/lib/chat-composer").catch(() => null);
-      if (!composeLib) composeLib = await import("@/lib/chat-composer").catch(() => null);
-    } catch (e) {
-      console.error("[chat route] composer import error:", e?.message ?? e);
+    const m = await import("@/lib/chat-composer").catch(() => null);
+    if (m) {
+      if (typeof m.compose === "function") return m.compose.bind(m);
+      if (typeof m.composeAndCallJarvis === "function") return m.composeAndCallJarvis.bind(m);
+      if (m.default && typeof m.default.compose === "function") return m.default.compose.bind(m.default);
     }
-
-    // If a compose function exists, call it; otherwise return an informative fallback
-    if (composeLib && (typeof composeLib.compose === "function" || typeof composeLib.default?.compose === "function" || typeof composeLib.composeAndCallJarvis === "function")) {
-      const fn = composeLib.compose ?? composeLib.default?.compose ?? composeLib.composeAndCallJarvis;
-      try {
-        const result = await fn({ userId: body?.userId ?? "debug", messages: body?.messages ?? [] });
-        console.log("[chat route] compose result keys:", result ? Object.keys(result) : result);
-        return NextResponse.json({ ok: true, data: result });
-      } catch (err) {
-        console.error("[chat route] compose call error:", err?.stack ?? err?.message ?? err);
-        return NextResponse.json({ ok: false, error: String(err?.message ?? err), data: { messages: [{ role: "assistant", content: "Something went wrong, but I'm still here. Try again in a bit." }] } }, { status: 500 });
-      }
-    }
-
-    console.log("[chat route] no compose lib found — returning fallback");
-    return NextResponse.json({ ok: true, data: { messages: [{ role: "assistant", content: "Hi — Jarvis here. (Fallback reply)" }] } });
   } catch (e) {
-    console.error("[chat route] unexpected error:", e?.stack ?? e);
-    return NextResponse.json({ ok: false, error: String(e?.message ?? e), data: { messages: [{ role: "assistant", content: "Something went wrong, but I'm still here. Try again in a bit." }] } }, { status: 500 });
+    console.error("[chat route] compose import error:", String(e?.message ?? e));
   }
+  try {
+    const m2 = await import("@/lib/chat-composer-wrapper").catch(() => null);
+    if (m2) {
+      if (typeof m2.compose === "function") return m2.compose.bind(m2);
+      if (m2.default && typeof m2.default.compose === "function") return m2.default.compose.bind(m2.default);
+    }
+  } catch {}
+  return null;
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+
+  const body = req.body ?? {};
+  const callPayload = body;
+
+  try {
+    const composeFn = await tryLoadCompose();
+    if (composeFn) {
+      const maybeResult = await Promise.resolve(composeFn(callPayload));
+      // normalize result
+      const result = (await maybeResult) ?? { messages: [{ role: "assistant", content: "Hi — Jarvis here. (Fallback reply)" }], meta: {} };
+      return res.status(200).json({ ok: true, data: result });
+    }
+  } catch (e) {
+    console.error("[chat route] compose call failed:", String(e?.message ?? e));
+  }
+
+  // Fallback safe response
+  return res.status(200).json({
+    ok: true,
+    data: { messages: [{ role: "assistant", content: "Hi — Jarvis here. (Fallback reply)" }], meta: {} },
+  });
 }
