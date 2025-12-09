@@ -10,6 +10,9 @@ import {
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 
+export const runtime = "nodejs";
+
+/** Types */
 type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
@@ -17,6 +20,7 @@ type ChatMessage = {
   created_at?: string;
 };
 
+/** Utility: detect simple time questions */
 function isTimeQuestion(text?: string | null) {
   if (!text) return false;
   const q = text.toLowerCase();
@@ -30,6 +34,7 @@ function isTimeQuestion(text?: string | null) {
   );
 }
 
+/** Simple intent tagger used to fetch relevant Knowledge Center blocks */
 function detectIntentTags(text?: string | null): string[] {
   if (!text) return ["general"];
   const q = text.toLowerCase();
@@ -75,6 +80,104 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
+/** Send message to Telegram using bot token; returns { ok, result|error } */
+async function sendTelegramText(chatId: number | string | undefined, text: string) {
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!TOKEN) {
+    console.error("Missing TELEGRAM_BOT_TOKEN");
+    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
+  }
+
+  const CHAT_ID = chatId ?? process.env.TELEGRAM_CHAT_ID;
+  if (!CHAT_ID) {
+    console.error("Missing chat id for Telegram send");
+    return { ok: false, error: "Missing chat id" };
+  }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text,
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      }),
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      console.error("Telegram send error:", json);
+      return { ok: false, error: json };
+    }
+    return { ok: true, result: json };
+  } catch (err) {
+    console.error("Telegram send exception:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Save reminder row to supabase */
+async function saveReminderToSupabase(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  sendAtIso: string,
+  message: string
+) {
+  try {
+    const payload = {
+      user_id: userId,
+      send_at: sendAtIso,
+      message,
+      status: "scheduled",
+    };
+    const { data, error } = await supabase.from("jarvis_reminders").insert([payload]).select().single();
+    if (error) {
+      console.error("Error inserting reminder:", error);
+      return { ok: false, error };
+    }
+    return { ok: true, data };
+  } catch (err) {
+    console.error("Exception saving reminder:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Extract first JSON object from text (handles fenced ```json blocks and trailing commas) */
+function extractFirstJsonObject(text?: string | null): any | null {
+  if (!text) return null;
+  // try fenced json block first
+  const fenceMatch = text.match(/```(?:json)?\n([\s\S]*?)\n```/i);
+  let candidate = fenceMatch ? fenceMatch[1] : text;
+
+  const start = candidate.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < candidate.length; i++) {
+    const ch = candidate[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        const jsonText = candidate.slice(start, i + 1);
+        try {
+          return JSON.parse(jsonText);
+        } catch (e) {
+          // relaxed parse: strip trailing commas
+          try {
+            const cleaned = jsonText.replace(/,(\s*[}\]])/g, "$1");
+            return JSON.parse(cleaned);
+          } catch (e2) {
+            return null;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** Main handler */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -102,21 +205,22 @@ export async function POST(req: NextRequest) {
 
     // --- Load finance snapshot ---
     const finance = await loadFinance(supabase);
+    const financeSnippet = buildFinanceContextSnippet(finance);
 
+    // --- Time & last message parsing ---
     const timezone: string = profile?.timezone || "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
     const lastMessage = messages[messages.length - 1];
-    const lastUserContent =
-      lastMessage?.role === "user" ? lastMessage.content : undefined;
+    const lastUserContent = lastMessage?.role === "user" ? lastMessage.content : undefined;
 
-    // --- 0) Pure time questions: handled in backend, NOT LLM ---
+    // 0) time question handled server-side
     if (isTimeQuestion(lastUserContent)) {
       const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       return NextResponse.json({ reply }, { status: 200 });
     }
 
-    // --- 0.5) "How much percent of target" questions: backend math only ---
+    // 0.5) percent-of-target math handled server-side
     if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
       const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
       if (answer) {
@@ -124,27 +228,19 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // --- 1) Tag user messages with [sent_at: ...] for temporal reasoning ---
+    // 1) tag user messages with [sent_at: ...]
     const messagesWithTime = messages.map((m) => {
-      const sentAt =
-        m.createdAt ||
-        m.created_at ||
-        new Date().toISOString();
-
+      const sentAt = m.createdAt || m.created_at || new Date().toISOString();
       if (m.role === "user") {
         return {
           role: m.role,
           content: `[sent_at: ${sentAt}] ${m.content}`,
         };
       }
-
-      return {
-        role: m.role,
-        content: m.content,
-      };
+      return { role: m.role, content: m.content };
     });
 
-    // --- 2) Build Knowledge Center context (your manual teachings) ---
+    // 2) Knowledge Center
     const intentTags = detectIntentTags(lastUserContent);
     const knowledgeBlocks = await buildKnowledgeContext({
       intentTags,
@@ -164,16 +260,11 @@ ${b.instructions ? `How Jarvis must use this:\n${b.instructions}\n` : ""}`
             )
             .join("\n");
 
-    // --- 3) Build Jarvis system prompt with profile + finance + time + knowledge ---
+    // 3) Build system prompt (includes server-action rules)
     const displayName = profile?.display_name || "Bro";
-    const bio =
-      profile?.bio ||
-      "Disciplined trader building systems to control impulses and grow steadily.";
-    const mainGoal =
-      profile?.main_goal ||
-      "Become a consistently profitable, rule-based trader.";
-    const currentFocus =
-      profile?.current_focus || "December: Discipline over profits.";
+    const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
+    const mainGoal = profile?.main_goal || "Become a consistently profitable, rule-based trader.";
+    const currentFocus = profile?.current_focus || "Discipline over profits.";
 
     const typicalWake = profile?.typical_wake_time || "06:30";
     const typicalSleep = profile?.typical_sleep_time || "23:30";
@@ -184,10 +275,33 @@ ${b.instructions ? `How Jarvis must use this:\n${b.instructions}\n` : ""}`
     const empathy = profile?.empathy_level ?? 7;
     const humor = profile?.humor_level ?? 5;
 
-    const financeSnippet = buildFinanceContextSnippet(finance);
-
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
+You are allowed to instruct the server to perform actions (send Telegram messages, schedule reminders).
+When you need the server to perform an action, output a single JSON object (no other text in the same JSON block). Example:
+
+\`\`\`json
+{
+  "action": "send_telegram",
+  "chat_id": 123456789,
+  "text": "Bro — quick reminder: check your daily limits."
+}
+\`\`\`
+
+or
+
+\`\`\`json
+{
+  "action": "schedule_reminder",
+  "time": "2025-12-09T10:00:00.000Z",
+  "text": "Reminder: close trades and review risk."
+}
+\`\`\`
+
+Rules:
+- The model should produce the JSON object only when it truly intends to trigger a server action.
+- If both conversational reply and action are needed, prefer returning a short assistant message followed by a separate JSON action block.
+- The server will parse the first JSON object it finds and execute it.
 
 USER ID: "single-user"
 
@@ -221,70 +335,12 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 ${financeSnippet}
 
 USER TEACHINGS (KNOWLEDGE CENTER):
-The user has manually defined the following rules, concepts, formulas, and stories.
-These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math.
-
 ${knowledgeSection}
 
 CONVERSATION & LISTENING:
-
-1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
-   - Do NOT lecture.
-   - Ask a brief clarifying question to understand exactly what they meant.
-
-2) For general trading/math questions where the server has NOT already calculated the result:
-   - Listen carefully, restate key numbers briefly, then answer.
-   - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
-   - Keep coaching short and specifically tied to the numbers they gave you.
-
-3) Coaching style:
-   - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
-   - For example, remind him that a calm monthly return close to his "safe monthly return percent"
-     can already cover his living costs, so he doesn't need to gamble today.
-   - Avoid generic speeches; stay tightly connected to his actual question and context.
-
-MATH & LISTENING PROTOCOL (STRICT):
-
-1) ALWAYS extract the key numbers the user gives:
-   - account size(s)
-   - profit/loss amounts
-   - target percentages
-   - evaluation rules (daily max loss, total max loss, target, etc.)
-
-2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
-   - If the user gives numbers or asks "how much", "how many", 
-     "what percent", "how far from target", ALWAYS answer with the 
-     raw calculation FIRST.
-   - Format answers like this:
-       • Result summary (1 line)
-       • Tiny breakdown (1–2 lines max)
-       • Then OPTIONAL coaching (1 line max)
-
-3) NEVER GUESS NUMBERS.
-   - If something is unclear, ask ONE clarifying question.
-   - DO NOT assume the initial capital if the user did not say it.
-
-4) WHEN THE USER PROVIDES A CORRECTION:
-   - Immediately apologize briefly.
-   - Restate the corrected numbers.
-   - Recalculate CORRECTLY.
-   - Provide the clean updated answer BEFORE ANY coaching.
-
-5) COACHING RULE:
-   - Coaching must always come AFTER the numeric answer.
-   - Coaching must be short (1–2 lines max).
-   - Coaching MUST relate directly to the user's numbers and goal.
-   - DO NOT give generic lectures.
-
-6) STRICT PRIORITY ORDER:
-   (1) Listen and extract numbers  
-   (2) Compute  
-   (3) Present result  
-   (4) Optional coaching  
-
-Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
+- Be strict but caring.
+- ALWAYS extract numbers and compute before coaching.
+- For "send to Telegram" or "remind me at ..." requests, produce a JSON action object as shown above.
 `.trim();
 
     const finalMessages = [
@@ -292,7 +348,7 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
       ...messagesWithTime,
     ];
 
-    // --- 4) Call Groq LLM for normal chat path ---
+    // 4) Call Groq LLM
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: finalMessages,
@@ -305,20 +361,72 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
       typeof replyMessage?.content === "string"
         ? replyMessage.content
         : Array.isArray(replyMessage?.content)
-        ? replyMessage.content
-            .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
-            .join("\n")
+        ? replyMessage.content.map((c: any) => (typeof c === "string" ? c : c.text ?? "")).join("\n")
         : "Sorry, I couldn't generate a response.";
 
+    // --- ACTION PARSING & HANDLING ---
+    const maybeAction = extractFirstJsonObject(replyContent);
+
+    if (maybeAction && maybeAction.action) {
+      const action = maybeAction.action;
+      try {
+        if (action === "send_telegram") {
+          const text: string = maybeAction.text ?? "";
+          const chatId = maybeAction.chat_id ?? process.env.TELEGRAM_CHAT_ID;
+          const tg = await sendTelegramText(chatId, text);
+
+          // log to supabase (optional telemetry)
+          try {
+            await supabase.from("jarvis_notifications").insert([
+              {
+                user_id: "single-user",
+                type: "telegram",
+                payload: { action: "send_telegram", chat_id: chatId, text },
+                result: tg,
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          } catch (e) {
+            console.error("Log notification error:", e);
+          }
+        } else if (action === "schedule_reminder") {
+          const time = maybeAction.time;
+          const text = maybeAction.text ?? "";
+          if (!time) {
+            console.error("schedule_reminder missing time");
+          } else {
+            const saveRes = await saveReminderToSupabase(supabase, "single-user", time, text);
+            // if scheduled time is <= now, attempt immediate send and mark sent
+            try {
+              if (saveRes.ok && saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
+                const chatId = process.env.TELEGRAM_CHAT_ID;
+                const sendRes = await sendTelegramText(chatId!, text);
+                if (sendRes.ok) {
+                  await supabase
+                    .from("jarvis_reminders")
+                    .update({ status: "sent", sent_at: new Date().toISOString() })
+                    .eq("id", saveRes.data.id);
+                } else {
+                  console.error("Immediate send failed for scheduled reminder", sendRes);
+                }
+              }
+            } catch (e) {
+              console.error("Immediate send for scheduled reminder failed:", e);
+            }
+          }
+        } else {
+          console.log("Unknown action from model:", action);
+        }
+      } catch (e) {
+        console.error("Error handling action:", e);
+      }
+    }
+
+    // Return the assistant's full reply (may include JSON block) to the client
     return NextResponse.json({ reply: replyContent }, { status: 200 });
   } catch (error: unknown) {
     console.error("CHAT API ERROR:", error);
-    const message =
-      error instanceof Error ? error.message : String(error);
-
-    return NextResponse.json(
-      { reply: "Jarvis brain crashed: " + message },
-      { status: 200 }
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    return NextResponse.json({ reply: "Jarvis brain crashed: " + message }, { status: 200 });
   }
 }
