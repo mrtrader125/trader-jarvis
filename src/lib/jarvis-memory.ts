@@ -7,7 +7,7 @@
  * - Provides: embedText, saveMemory, upsertMemoryEmbedding, getRelevantMemories,
  *   fetchRelevantMemories (compat wrapper), saveConversation, summarizeIfNeeded,
  *   writeJournal, getMemoryById
- * - New/updated: buildPromptWithMemory supports both:
+ * - buildPromptWithMemory supports both:
  *     a) positional: (userId, instruction, convoHistory?, memoryLimit?) => { prompt, memories }
  *     b) compat object: ({ nowInfo, memorySummary, lastAnswersForQuestions }) => string
  *
@@ -228,18 +228,25 @@ export async function getMemoryById(memoryId: string) {
 /**
  * buildPromptWithMemory
  *
- * Two usable call styles:
- *
- * 1) Positional (current preferred):
- *    buildPromptWithMemory(userId: string, instruction: string, convoHistory?: Message[], memoryLimit?: number)
- *    -> returns Promise<{ prompt: string; memories: MemoryRow[] }>
- *
- * 2) Compatibility object (older callers expect this):
- *    buildPromptWithMemory({ nowInfo, memorySummary, lastAnswersForQuestions })
- *    -> returns Promise<string>    (only the composed prompt string)
- *
- * The function auto-detects the signature and returns the appropriate shape.
+ * Overloads: provide TypeScript signatures for both call styles
  */
+
+// Overload 1: positional (preferred)
+export function buildPromptWithMemory(
+  userId: string,
+  instruction: string,
+  convoHistory?: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[],
+  memoryLimit?: number
+): Promise<{ prompt: string; memories: MemoryRow[] }>;
+
+// Overload 2: compatibility object
+export function buildPromptWithMemory(opts: {
+  nowInfo?: any;
+  memorySummary?: string | null;
+  lastAnswersForQuestions?: Record<string, { lastAnswer: string | null; lastAt?: string | null }>;
+}): Promise<string>;
+
+/** Implementation (varargs) */
 export async function buildPromptWithMemory(...args: any): Promise<any> {
   // Compat object detection: single arg with nowInfo or memorySummary
   if (args.length === 1 && typeof args[0] === 'object' && (args[0].nowInfo || args[0].memorySummary)) {
