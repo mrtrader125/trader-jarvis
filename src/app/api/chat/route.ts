@@ -80,7 +80,7 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
-/** Send message to Telegram using bot token; returns { ok, result|error } */
+/** Send message to Telegram using bot token; returns { ok, result|error, raw? } with human-friendly error */
 async function sendTelegramText(chatId: number | string | undefined, text: string) {
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   if (!TOKEN) {
@@ -106,30 +106,25 @@ async function sendTelegramText(chatId: number | string | undefined, text: strin
       }),
     });
 
-    // always attempt to parse JSON safely
+    // parse response safely
     let json: any = null;
     try {
       json = await res.json();
     } catch (parseErr) {
       console.warn("Telegram response not JSON:", parseErr);
-      // fallback to text
       const txt = await res.text();
       return { ok: res.ok, error: txt || `HTTP ${res.status}` };
     }
 
     if (!res.ok) {
-      // prefer the description field from Telegram response if available
-      const desc =
-        (json && (json.description || json.error || JSON.stringify(json))) ??
-        `HTTP ${res.status}`;
+      const desc = json?.description ?? json?.error ?? JSON.stringify(json);
       console.error("Telegram API returned error:", desc, json);
       return { ok: false, error: desc, raw: json };
     }
 
-    return { ok: true, result: json };
+    return { ok: true, result: json, raw: json };
   } catch (err: any) {
     console.error("Telegram send exception:", err);
-    // err could be a network error — convert to string
     return { ok: false, error: String(err) };
   }
 }
@@ -163,7 +158,6 @@ async function saveReminderToSupabase(
 /** Extract first JSON object from text (handles fenced ```json blocks and trailing commas) */
 function extractFirstJsonObject(text?: string | null): any | null {
   if (!text) return null;
-  // try fenced json block first
   const fenceMatch = text.match(/```(?:json)?\n([\s\S]*?)\n```/i);
   let candidate = fenceMatch ? fenceMatch[1] : text;
 
@@ -180,7 +174,6 @@ function extractFirstJsonObject(text?: string | null): any | null {
         try {
           return JSON.parse(jsonText);
         } catch (e) {
-          // relaxed parse: strip trailing commas
           try {
             const cleaned = jsonText.replace(/,(\s*[}\]])/g, "$1");
             return JSON.parse(cleaned);
@@ -197,13 +190,10 @@ function extractFirstJsonObject(text?: string | null): any | null {
 /** Remove the first JSON block (fenced ```json``` section or first {...}) from text and return cleaned string */
 function removeFirstJsonBlock(text?: string | null): string {
   if (!text) return "";
-  // remove fenced block if present
   const fenced = /```(?:json)?\n([\s\S]*?)\n```/i;
   if (fenced.test(text)) {
     return text.replace(fenced, "").trim();
   }
-
-  // otherwise remove first {...} balanced block
   const start = text.indexOf("{");
   if (start === -1) return text.trim();
   let depth = 0;
@@ -213,7 +203,6 @@ function removeFirstJsonBlock(text?: string | null): string {
     else if (ch === "}") {
       depth--;
       if (depth === 0) {
-        // remove from start to i inclusive
         const cleaned = (text.slice(0, start) + text.slice(i + 1)).trim();
         return cleaned;
       }
@@ -437,7 +426,15 @@ CONVERSATION & LISTENING:
             console.error("Log notification error:", e);
           }
 
-          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${String(tg.error)}`;
+          const tgError = tg.error;
+          const tgErrorMsg =
+            typeof tgError === "string"
+              ? tgError
+              : tgError && typeof tgError === "object"
+              ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
+              : String(tgError);
+
+          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
         } else if (action === "schedule_reminder") {
           const time = maybeAction.time;
           const text = maybeAction.text ?? "";
@@ -460,7 +457,14 @@ CONVERSATION & LISTENING:
                       .eq("id", saveRes.data.id);
                     actionResultSummary = `Reminder scheduled and sent immediately.`;
                   } else {
-                    actionResultSummary = `Reminder scheduled but immediate send failed: ${String(sendRes.error)}`;
+                    const sendErr = sendRes.error;
+                    const sendErrMsg =
+                      typeof sendErr === "string"
+                        ? sendErr
+                        : sendErr && typeof sendErr === "object"
+                        ? (sendErr.description ?? sendErr.error ?? JSON.stringify(sendErr))
+                        : String(sendErr);
+                    actionResultSummary = `Reminder scheduled but immediate send failed: ${sendErrMsg}`;
                   }
                 }
               } catch (e) {
