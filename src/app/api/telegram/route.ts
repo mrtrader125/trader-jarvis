@@ -286,6 +286,23 @@ function likelyAnswersSetupQuestion(text?: string | null) {
   return setupWords.some((w) => q.includes(w));
 }
 
+/** Helper: parse numeric chat id candidates safely */
+function parseChatId(candidate: any): number | null {
+  if (candidate === null || candidate === undefined) return null;
+  if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  if (typeof candidate === "string") {
+    const trimmed = candidate.trim();
+    if (/^-?\d+$/.test(trimmed)) {
+      try {
+        return Number(trimmed);
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const update = (await req.json()) as TelegramUpdate;
@@ -466,38 +483,61 @@ CONVERSATION & LISTENING (TELEGRAM):
     if (maybeAction && maybeAction.action) {
       try {
         const action = maybeAction.action;
+        // ---------- Updated send_telegram handler (safe, validated chat id) ----------
         if (action === "send_telegram") {
-          const text: string = maybeAction.text ?? "";
-          const chatTarget = maybeAction.chat_id ?? chatId;
-          const tg = await sendTelegramText(chatTarget, text);
+          const actionText: string = maybeAction.text ?? "";
+          const modelCandidate = maybeAction.chat_id ?? null;
 
-          const tgError = tg.error;
-          const tgErrorMsg =
-            typeof tgError === "string"
-              ? tgError
-              : tgError && typeof tgError === "object"
-              ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
-              : String(tgError);
+          // 1) prefer model-provided numeric chat_id only if it's a valid integer
+          let chatTarget = parseChatId(modelCandidate);
 
-          actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
+          // 2) fallback to saved profile value (strong preference)
+          if (!chatTarget && profile?.telegram_chat_id) {
+            chatTarget = parseChatId(profile.telegram_chat_id);
+          }
 
-          // non-blocking log
-          (async () => {
+          // 3) fallback to env TELEGRAM_CHAT_ID if present
+          if (!chatTarget && process.env.TELEGRAM_CHAT_ID) {
+            chatTarget = parseChatId(process.env.TELEGRAM_CHAT_ID);
+          }
+
+          // 4) if still no chatTarget, fail with friendly message rather than calling Telegram
+          if (!chatTarget) {
+            actionResultSummary =
+              "Failed to send: no valid chat id found. Open the bot in Telegram and press Start so Jarvis can message you, or set TELEGRAM_CHAT_ID in env.";
+          } else {
+            // Ensure chatTarget is a number and call sendTelegramText
+            const tg = await sendTelegramText(Number(chatTarget), String(actionText));
+
+            // human-friendly error string extraction
+            const tgError = tg.error;
+            const tgErrorMsg =
+              typeof tgError === "string"
+                ? tgError
+                : tgError && typeof tgError === "object"
+                ? (tgError.description ?? tgError.error ?? JSON.stringify(tgError))
+                : String(tgError);
+
+            actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
+
+            // optional telemetry logging (non-blocking)
             try {
               await supabase.from("jarvis_notifications").insert([
                 {
                   user_id: "single-user",
                   type: "telegram",
-                  payload: { action: "send_telegram", chat_id: chatTarget, text },
+                  payload: { action: "send_telegram", chat_id: chatTarget, text: actionText },
                   result: tg,
                   created_at: new Date().toISOString(),
                 },
               ]);
-            } catch (e) {
-              console.warn("notification log failed:", e);
+            } catch (err) {
+              console.warn("Failed to log notification:", err);
             }
-          })();
-        } else if (action === "schedule_reminder") {
+          }
+        }
+        // ---------- schedule_reminder unchanged ----------
+        else if (action === "schedule_reminder") {
           const time = maybeAction.time;
           const text = maybeAction.text ?? "";
           if (!time) {
