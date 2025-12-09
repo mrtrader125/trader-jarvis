@@ -10,6 +10,9 @@ import {
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
+import { tryCreateReminderFromText } from "@/lib/jarvis/reminders";
+
+// Preserved helpers from OLD file (tone, history, trading memory)
 import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
 import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
 import {
@@ -186,8 +189,12 @@ export async function POST(req: NextRequest) {
 
     const supabase = createClient();
 
-    // Update trading memory from what you say
-    await autoUpdateTradingMemoryFromUtterance(supabase, userText);
+    // --- Attempt to update trading memory (preserve old behavior; non-fatal) ---
+    try {
+      await autoUpdateTradingMemoryFromUtterance(supabase, userText);
+    } catch (e) {
+      console.error("autoUpdateTradingMemoryFromUtterance error:", e);
+    }
 
     // --- Profile ---
     let profile: any = null;
@@ -236,26 +243,64 @@ export async function POST(req: NextRequest) {
     const tradingProfile = await loadTradingProfile(supabase);
     const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
-    // --- 0) Time questions (no LLM) ---
+    // --- 0) Reminder creation (Telegram) ---
+    try {
+      const reminderResult = await tryCreateReminderFromText({
+        text: userText,
+        supabase,
+        source: "telegram",
+        timezone,
+        telegramChatId: chatId,
+      });
+
+      if (reminderResult) {
+        const reply = reminderResult.confirmation;
+        await sendTelegramText(chatId, reply);
+        const audio = await synthesizeTTS(reply);
+        if (audio) await sendTelegramVoice(chatId, audio);
+
+        // Also save confirmation to history (preserve OLD behavior)
+        try {
+          await saveHistoryPair({
+            supabase,
+            channel: "telegram",
+            userText,
+            assistantText: reply,
+          });
+        } catch (e) {
+          console.error("Error saving reminder confirmation to history:", e);
+        }
+
+        return NextResponse.json({ ok: true });
+      }
+    } catch (e) {
+      console.error("tryCreateReminderFromText error:", e);
+    }
+
+    // --- 0.1) Time questions (no LLM) ---
     if (isTimeQuestion(userText)) {
-      const replyRaw = `Bro, it's ${nowInfo.timeString} for us in ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const replyRaw = `It's currently ${nowInfo.timeString} in our local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
 
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
       if (audio) await sendTelegramVoice(chatId, audio);
 
-      await saveHistoryPair({
-        supabase,
-        channel: "telegram",
-        userText,
-        assistantText: reply,
-      });
+      try {
+        await saveHistoryPair({
+          supabase,
+          channel: "telegram",
+          userText,
+          assistantText: reply,
+        });
+      } catch (e) {
+        console.error("Error saving time reply to history:", e);
+      }
 
       return NextResponse.json({ ok: true });
     }
 
-    // --- 0.5) Percent-of-target questions: deterministic math only ---
+    // --- 0.2) Percent-of-target questions: deterministic math only ---
     const percentQuestionIntent =
       !!userText &&
       (
@@ -273,12 +318,16 @@ export async function POST(req: NextRequest) {
         const audio = await synthesizeTTS(reply);
         if (audio) await sendTelegramVoice(chatId, audio);
 
-        await saveHistoryPair({
-          supabase,
-          channel: "telegram",
-          userText,
-          assistantText: reply,
-        });
+        try {
+          await saveHistoryPair({
+            supabase,
+            channel: "telegram",
+            userText,
+            assistantText: reply,
+          });
+        } catch (e) {
+          console.error("Error saving percent answer to history:", e);
+        }
 
         return NextResponse.json({ ok: true });
       }
@@ -308,7 +357,7 @@ ${
             )
             .join("\n");
 
-    // --- 2) Tone engine + style preferences for Telegram ---
+    // --- 2) Tone engine + style preferences for Telegram (preserve OLD behavior) ---
     const toneMode = detectToneMode(userText || "", "telegram");
     const toneDirective = buildToneDirective(toneMode, "telegram");
 
@@ -321,37 +370,30 @@ ${
 - When summarizing or listing things about him, avoid "*" star bullets unless he asks; use numbered lists or simple dashes.
 `;
 
-    // --- 2.5) Load recent shared history (web + telegram) ---
-    const recentHistory = await loadRecentHistory({
-      supabase,
-      userId: "single-user",
-      limit: 10,
-    });
+    // --- 2.5) Load recent shared history (web + telegram) (preserve OLD behavior) ---
+    let historyMessages: { role: "user" | "assistant"; content: string }[] = [];
+    try {
+      const recentHistory = await loadRecentHistory({
+        supabase,
+        userId: "single-user",
+        limit: 10,
+      });
 
-    const historyMessages = recentHistory.map((h) => ({
-      role: h.role as "user" | "assistant",
-      content: h.content,
-    }));
+      historyMessages = recentHistory.map((h) => ({
+        role: h.role as "user" | "assistant",
+        content: h.content,
+      }));
+    } catch (e) {
+      console.error("Error loading recent history:", e);
+      historyMessages = [];
+    }
 
-    // --- 3) Build system prompt ---
+    // --- 3) Build system prompt: profile + finance + time + knowledge + protocol ---
     const systemPrompt = `
 ${toneDirective}
 ${styleBlock}
 
-[Identity]
-You are Jarvis, ONE single person – his long-term trading & life companion and assistant.
-You talk to him through two doors: the web app and Telegram, but you are always
-the same Jarvis with the same memory and personality.
-
-[Emotional Safety Rule]
-If the user expresses worry, fear, regret, stress, confusion, FOMO, or panic 
-(for example: "I'm worried", "I'm scared", "I'm stressed", "I have a running trade 😢", "I feel FOMO"),
-you MUST:
-1) Acknowledge the emotion first, in a warm, short way.
-2) Stabilize with a brief reassurance (for example: "breathe", "you're okay", "one trade doesn't define you").
-3) THEN ask at most ONE focused question or offer ONE simple next step.
-4) Avoid interrogating or judging their decision while they are clearly emotional.
-5) Once they are calmer, you can shift into discipline or trading analysis if relevant.
+You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
 USER ID: "single-user"
 
@@ -372,7 +414,7 @@ Personality sliders (0–10):
 - Empathy: ${empathy}
 - Humor: ${humor}
 
-Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY RAW ISO UNLESS HE ASKS ABOUT TIME):
+Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS ABOUT TIME):
 - ISO: ${nowInfo.iso}
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
@@ -415,50 +457,12 @@ CONVERSATION & LISTENING (TELEGRAM):
    - Avoid generic speeches; stay tightly connected to his actual question and context.
 
 MATH & LISTENING PROTOCOL (STRICT):
-
-1) ALWAYS extract the key numbers the user gives:
-   - account size(s)
-   - profit/loss amounts
-   - target percentages
-   - evaluation rules (daily max loss, total max loss, target, etc.)
-
-2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
-   - If the user gives numbers or asks "how much", "how many", 
-     "what percent", "how far from target", ALWAYS answer with the 
-     raw calculation FIRST.
-   - Format answers like this:
-       1. Result summary (1 line)
-       2. Tiny breakdown (1–2 lines max)
-       3. Optional coaching (1 line max)
-
-3) NEVER GUESS NUMBERS.
-   - If something is unclear, ask ONE clarifying question.
-   - DO NOT assume the initial capital if the user did not say it.
-
-4) WHEN THE USER PROVIDES A CORRECTION:
-   - Immediately apologize briefly.
-   - Restate the corrected numbers.
-   - Recalculate CORRECTLY.
-   - Provide the clean updated answer BEFORE ANY coaching.
-
-5) COACHING RULE:
-   - Coaching must always come AFTER the numeric answer.
-   - Coaching must be short (1–2 lines max).
-   - Coaching MUST relate directly to the user's numbers and goal.
-   - DO NOT give generic lectures.
-
-6) STRICT PRIORITY ORDER:
-   (1) Listen and extract numbers  
-   (2) Compute  
-   (3) Present result  
-   (4) Optional coaching  
-
-Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules and trading profile memory as the user's personal doctrine whenever relevant.
+- ALWAYS extract the key numbers the user gives and answer with raw calculation first, followed by a tiny breakdown and optional short coaching.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
 
+    // --- 4) Call Groq LLM for normal chat path ---
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: [
@@ -479,12 +483,17 @@ Use the Knowledge Center rules and trading profile memory as the user's personal
     const audio = await synthesizeTTS(replyText);
     if (audio) await sendTelegramVoice(chatId, audio);
 
-    await saveHistoryPair({
-      supabase,
-      channel: "telegram",
-      userText: userMessageForModel,
-      assistantText: replyText,
-    });
+    // --- Save to shared history (preserve OLD behavior) ---
+    try {
+      await saveHistoryPair({
+        supabase,
+        channel: "telegram",
+        userText: userMessageForModel,
+        assistantText: replyText,
+      });
+    } catch (e) {
+      console.error("Error saving chat reply to history:", e);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
