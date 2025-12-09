@@ -1,49 +1,88 @@
-// Simple reminder pinger.
-// Right now it sends to a fixed list of chat IDs.
-// Later we can store subscribers in a DB and ping them from a cron job.
+// src/app/api/reminder-ping/route.ts
 
-async function sendTelegramMessage(chatId, text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) {
-    console.error("TELEGRAM_BOT_TOKEN missing");
+import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+async function sendTelegramText(chatId: string, text: string) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error("Missing TELEGRAM_BOT_TOKEN in reminder-ping");
     return;
   }
 
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "Markdown",
-    }),
-  });
+  await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+      }),
+    }
+  );
 }
 
 export async function GET() {
   try {
-    // TODO: replace this with your real chat id(s).
-    // Get it by sending /id to your bot and reading the reply.
-    const CHAT_IDS = [6495161093];
+    const supabase = createClient();
+    const nowIso = new Date().toISOString();
 
-    if (CHAT_IDS.length === 0) {
-      console.warn("No chat IDs configured in reminder-ping");
-      return new Response("No chat ids configured", { status: 200 });
+    // Get all due, undelivered reminders (limit so we don't spam).
+    const { data, error } = await supabase
+      .from("jarvis_reminders")
+      .select("*")
+      .is("delivered_at", null)
+      .lte("due_at", nowIso)
+      .order("due_at", { ascending: true })
+      .limit(30);
+
+    if (error) {
+      console.error("Error loading reminders:", error.message);
+      return NextResponse.json({ ok: false });
     }
 
-    const message =
-      "Yo bro 🕒\n\nQuick reminder from Jarvis:\n- Do your *daily check-in*.\n- Stick to your trading rules.\n- No revenge trades, no FOMO.\n\nYou got this. 💪";
+    if (!data || data.length === 0) {
+      return NextResponse.json({ ok: true, sent: 0 });
+    }
 
-    await Promise.all(
-      CHAT_IDS.map((id) => sendTelegramMessage(id, message))
-    );
+    for (const rem of data) {
+      const chatId: string | null =
+        rem.chat_id ||
+        process.env.TELEGRAM_PRIMARY_CHAT_ID ||
+        null;
 
-    return new Response("reminders sent", { status: 200 });
-  } catch (err) {
-    console.error("Error in reminder-ping:", err);
-    return new Response("error", { status: 200 });
+      if (!chatId) {
+        console.error(
+          "Reminder has no chat_id and TELEGRAM_PRIMARY_CHAT_ID is missing. Skipping.",
+          rem.id
+        );
+        continue;
+      }
+
+      const text = `Bro, reminder: ${rem.body}`;
+
+      try {
+        await sendTelegramText(chatId, text);
+      } catch (e) {
+        console.error("Failed to send reminder to Telegram:", e);
+        continue;
+      }
+
+      // Mark as delivered
+      await supabase
+        .from("jarvis_reminders")
+        .update({ delivered_at: new Date().toISOString() })
+        .eq("id", rem.id);
+    }
+
+    return NextResponse.json({ ok: true, sent: data.length });
+  } catch (e) {
+    console.error("REMINDER-PING ERROR:", e);
+    return NextResponse.json({ ok: false });
   }
 }
-
