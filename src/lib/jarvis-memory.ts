@@ -1,276 +1,210 @@
-// src/lib/jarvis-memory.ts
+// src/app/api/telegram/processPending/route.ts
 /**
- * jarvis-memory.ts
+ * Worker to import telegram webhook raw journal rows into telegram_updates,
+ * process pending updates, call Jarvis composer, send replies, and mark processed.
  *
- * Supabase-based memory helpers for Jarvis.
- * - getRelevantMemories(...) returns MemoryRow[]
- * - fetchRelevantMemories(...) (compatibility) returns items shaped for summarizer:
- *     { id?, text: string, type?: string }[]
- *
- * This file is intentionally dependency-light and uses the project's
- * Supabase server client factory at "@/lib/supabase/server".
+ * Protected by X-JARVIS-KEY header (JARVIS_API_KEY env).
  */
 
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import composeLib from '@/lib/chat-composer';
+import memoryLib from '@/lib/jarvis-memory';
 
-// Types
-export type MemoryRow = {
-  id: string;
-  user_id: string;
-  type?: string;
-  title?: string;
-  content?: any;
-  embedding?: any;
-  importance?: number;
-  tags?: string[];
-  status?: string;
-  created_at?: string;
-  updated_at?: string;
-};
+const supabase = createClient();
 
-export type ConversationRow = {
-  id?: string;
-  // Accept both naming styles so callers using camelCase or snake_case work.
-  userId?: string;
-  user_id?: string;
-  messages: any[];
-  summary?: string;
-  last_active?: string;
-  embedding?: any;
-  created_at?: string;
-  updated_at?: string;
-};
+export const runtime = 'nodejs';
 
-// Helper to get Supabase server client (wrap to keep portability)
-function supabaseClient() {
-  return createClient();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? null;
+const TELEGRAM_API_BASE = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : null;
+const JARVIS_API_KEY = process.env.JARVIS_API_KEY ?? null;
+
+/** Helper to send a Telegram text message */
+async function sendTelegramMessage(chatId: number | string, text: string, replyToMessageId?: number) {
+  if (!TELEGRAM_API_BASE) throw new Error('TELEGRAM_BOT_TOKEN not configured');
+  const url = `${TELEGRAM_API_BASE}/sendMessage`;
+  const body: any = { chat_id: chatId, text, parse_mode: 'Markdown' };
+  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  return json;
 }
 
-/**
- * embedText
- * - Placeholder embedding function. Replace with your embedding provider call.
- * - Returns a vector (array of numbers) or null if embedding not available.
- */
-export async function embedText(text: string): Promise<number[] | null> {
+/** Import raw journal rows into telegram_updates table (idempotent) */
+async function importFromJournal(limit = 50) {
   try {
-    if (!text) return null;
-    const v = new Array(8).fill(0).map((_, i) => (text.charCodeAt(i % text.length) || 0) % 100 / 100);
-    return v;
-  } catch (e) {
-    console.warn('embedText fallback failed:', e);
-    return null;
-  }
-}
-
-/**
- * saveMemory
- * Insert a memory row into 'memories' table (or update if id provided).
- */
-export async function saveMemory(userId: string, memory: Partial<MemoryRow>) {
-  const supabase = supabaseClient();
-  const row = {
-    user_id: userId,
-    type: memory.type ?? 'fact',
-    title: memory.title ?? null,
-    content: memory.content ?? null,
-    importance: memory.importance ?? 1,
-    tags: memory.tags ?? [],
-    status: memory.status ?? 'active',
-  };
-
-  try {
-    const { data, error } = await supabase.from('memories').insert(row).select().single();
-    if (error) throw error;
-    return data;
-  } catch (e) {
-    console.warn('saveMemory error:', e);
-    throw e;
-  }
-}
-
-/**
- * upsertMemoryEmbedding
- * Update a memory row with embedding vector (assumes memory row id exists).
- */
-export async function upsertMemoryEmbedding(memoryId: string, embedding: any) {
-  const supabase = supabaseClient();
-  try {
-    const { data, error } = await supabase.from('memories').update({ embedding }).eq('id', memoryId).select().single();
-    if (error) throw error;
-    return data;
-  } catch (e) {
-    console.warn('upsertMemoryEmbedding error:', e);
-    throw e;
-  }
-}
-
-/**
- * getRelevantMemories
- * Returns recent relevant memories for a user.
- *
- * Signature supports:
- *  - userId: string
- *  - tagFilter?: string[] | null
- *  - daysRange?: number | null  (number of days to look back; if null -> no time filter)
- *  - limit?: number (max rows to return)
- *
- * This implementation uses simple filters (tags contains & created_at >= since).
- */
-export async function getRelevantMemories(
-  userId: string,
-  tagFilter: string[] | null = null,
-  daysRange: number | null = null,
-  limit: number = 50
-): Promise<MemoryRow[]> {
-  const supabase = supabaseClient();
-
-  try {
-    let query: any = supabase
-      .from('memories')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
+    const { data: rawRows, error: rawErr } = await supabase
+      .from('journal')
+      .select('id, user_id, message')
+      .eq('source', 'telegram-webhook-raw')
       .limit(limit);
 
-    if (tagFilter && Array.isArray(tagFilter) && tagFilter.length > 0) {
-      // uses Postgres array/JSON contains; adjust if your schema differs
-      query = query.contains('tags', tagFilter);
-    }
+    if (rawErr) throw rawErr;
+    if (!rawRows || rawRows.length === 0) return 0;
 
-    if (daysRange && typeof daysRange === 'number') {
-      const since = new Date(Date.now() - daysRange * 24 * 60 * 60 * 1000).toISOString();
-      query = query.gte('created_at', since);
-    }
+    let imported = 0;
+    for (const r of rawRows) {
+      try {
+        const update = r.message;
+        const updateId = update?.update_id ?? (update?.message?.message_id ? Number(update.message.message_id) : null);
+        if (!updateId) continue;
 
-    const { data, error } = await query;
-    if (error) throw error;
-    return (data as MemoryRow[]) || [];
+        try {
+          await supabase
+            .from('telegram_updates')
+            .insert({
+              update_id: updateId,
+              user_id: String(update?.message?.from?.id ?? update?.message?.chat?.id ?? 'telegram_unknown'),
+              payload: update,
+              source: 'journal_import',
+            });
+        } catch (insertErr: any) {
+          // ignore duplicates / unique constraint errors
+        }
+        imported += 1;
+      } catch (e) {
+        continue;
+      }
+    }
+    return imported;
   } catch (e) {
-    console.warn('getRelevantMemories error:', e);
-    return [];
+    console.warn('importFromJournal failed:', e);
+    return 0;
   }
 }
 
-/**
- * fetchRelevantMemories (compatibility wrapper)
- * The summarizer expects items shaped as: { id?, text: string, type?: string }[]
- * Map MemoryRow -> this shape, deriving 'text' from memory.content if possible.
- */
-export async function fetchRelevantMemories(
-  userId: string,
-  tagFilter: string[] | null = null,
-  daysRange: number | null = null,
-  limit: number = 50
-): Promise<{ id?: any; text: string; type?: string }[]> {
-  const rows = await getRelevantMemories(userId, tagFilter, daysRange, limit);
+async function fetchPendingUpdates(batchSize = 10) {
+  const { data, error } = await supabase
+    .from('telegram_updates')
+    .select('id, update_id, user_id, payload, processed')
+    .eq('processed', false)
+    .order('created_at', { ascending: true })
+    .limit(batchSize);
 
-  return rows.map((r) => {
-    // Determine a text field from common shapes of content
-    let text = '';
-    if (!r.content) {
-      text = r.title ?? '';
-    } else if (typeof r.content === 'string') {
-      text = r.content;
-    } else if (typeof r.content === 'object') {
-      // common shape: { text: "...", body: "...", note: "..." }
-      text = r.content.text ?? r.content.body ?? r.content.note ?? r.title ?? JSON.stringify(r.content);
-    } else {
-      text = String(r.content);
-    }
-    return { id: r.id, text: String(text ?? ''), type: r.type ?? undefined };
-  });
+  if (error) throw error;
+  return data ?? [];
 }
 
-/**
- * saveConversation
- * Save a conversation snapshot to conversations table.
- * Accepts either `userId` (camelCase) or `user_id` (snake_case) and normalizes to `user_id`.
- */
-export async function saveConversation(row: ConversationRow) {
-  const supabase = supabaseClient();
-
-  // Normalize user id from either camelCase or snake_case
-  const userId = (row.userId ?? row.user_id ?? 'unknown') as string;
-
-  const payload = {
-    user_id: userId,
-    messages: row.messages ?? [],
-    summary: row.summary ?? null,
-    last_active: row.last_active ?? new Date().toISOString(),
-    embedding: row.embedding ?? null,
-  };
-
+async function markProcessed(id: string) {
   try {
-    const { data, error } = await supabase.from('conversations').insert(payload).select().single();
-    if (error) throw error;
+    const { data, error } = await supabase
+      .from('telegram_updates')
+      .update({ processed: true, processed_at: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) console.warn('markProcessed error:', error);
     return data;
   } catch (e) {
-    console.warn('saveConversation error:', e);
-    throw e;
+    console.warn('markProcessed exception:', e);
   }
 }
 
-/**
- * summarizeIfNeeded
- * Placeholder summarizer: produces a short summary if messages exceed threshold.
- * Replace with real LLM summarization or retriever as needed.
- */
-export async function summarizeIfNeeded(conversation: ConversationRow): Promise<string | null> {
+/** Process a single update: call Jarvis, send reply, save conversation/journal, mark processed */
+async function processUpdate(row: any) {
+  const payload = row.payload;
+  const updateId = row.update_id;
+  const chatId = payload?.message?.chat?.id ?? payload?.message?.from?.id;
+  const messageId = payload?.message?.message_id ?? null;
+  const userId = String(row.user_id ?? chatId ?? 'telegram_unknown');
+
+  // extract text if available
+  let text = payload?.message?.text ?? null;
+
+  // NOTE: this worker currently does NOT support voice->STT conversion.
+  if (!text) {
+    await supabase.from('journal').insert({ user_id: userId, message: { event: 'no_text_in_pending', update: payload }, source: 'processPending' });
+    await markProcessed(row.id);
+    return { ok: false, reason: 'no_text' };
+  }
+
+  // Build convoHistory with a single user message (typed so TS accepts it)
+  const convoHistory = [
+    {
+      role: 'user' as const,
+      content: String(text),
+      ts: new Date().toISOString(),
+    },
+  ];
+
+  // 1) Call Jarvis composer
+  let jarvisResp;
   try {
-    const text = (conversation.messages ?? []).map((m: any) => `${m.role}: ${m.content}`).join('\n');
-    if (text.length < 800) return null;
-    return text.slice(0, 300) + (text.length > 300 ? '...' : '');
+    jarvisResp = await composeLib.composeAndCallJarvis({
+      userId,
+      instruction: text,
+      convoHistory: convoHistory as any, // composer expects Message[]; casting to avoid strict coupling here
+    });
   } catch (e) {
-    console.warn('summarizeIfNeeded error:', e);
-    return null;
+    await supabase.from('journal').insert({ user_id: userId, message: { event: 'compose_error', error: String(e?.message ?? e), payload }, source: 'processPending' });
+    return { ok: false, reason: 'compose_error', error: String(e?.message ?? e) };
   }
-}
 
-/**
- * writeJournal
- * Write an audit log to the `journal` table.
- */
-export async function writeJournal(userId: string, message: any, source: string | null = null) {
-  const supabase = supabaseClient();
+  // 2) Save conversation & journal
   try {
-    const row = {
-      user_id: userId ?? 'unknown',
-      message,
-      source: source ?? 'app',
-    };
-    const { data, error } = await supabase.from('journal').insert(row).select().single();
-    if (error) throw error;
-    return data;
+    await memoryLib.saveConversation({
+      userId,
+      messages: convoHistory.concat([{ role: 'assistant' as const, content: jarvisResp?.text ?? '', ts: new Date().toISOString() }]) as any,
+      summary: `${String(text).slice(0, 400)}\n\nJARVIS: ${(jarvisResp?.text ?? '').slice(0, 800)}`,
+    });
+    await memoryLib.writeJournal(userId, { event: 'telegram_processed', update_id: updateId, provenance: jarvisResp?.provenance ?? [] }, 'processPending');
   } catch (e) {
-    console.warn('writeJournal error:', e);
-    return null;
+    console.warn('saveConversation/writeJournal failed:', e);
   }
-}
 
-/**
- * Utility: getMemoryById
- */
-export async function getMemoryById(memoryId: string) {
-  const supabase = supabaseClient();
+  // 3) Send reply to Telegram
   try {
-    const { data, error } = await supabase.from('memories').select('*').eq('id', memoryId).single();
-    if (error) throw error;
-    return data as MemoryRow;
+    const safeText = String(jarvisResp?.text ?? 'Jarvis is awake, but had nothing to say.');
+    if (TELEGRAM_API_BASE) {
+      await sendTelegramMessage(chatId, safeText, messageId);
+    }
   } catch (e) {
-    console.warn('getMemoryById error:', e);
-    return null;
+    await supabase.from('journal').insert({ user_id: userId, message: { event: 'send_message_failed', error: String(e?.message ?? e), update: payload }, source: 'processPending' });
+    return { ok: false, reason: 'send_failed', error: String(e?.message ?? e) };
   }
+
+  // 4) Mark processed
+  await markProcessed(row.id);
+  return { ok: true };
 }
 
-// Default export for compatibility with earlier code that expects default object
-export default {
-  embedText,
-  saveMemory,
-  upsertMemoryEmbedding,
-  getRelevantMemories,
-  fetchRelevantMemories,
-  saveConversation,
-  summarizeIfNeeded,
-  writeJournal,
-  getMemoryById,
-};
+/** Main handler: import journal rows (if needed), process a batch, return summary */
+export async function POST(req: NextRequest) {
+  // Protect endpoint with API key (x-jarvis-key)
+  const incomingKey = req.headers.get('x-jarvis-key') ?? req.headers.get('x-jarvis-key'.toLowerCase());
+  if (!JARVIS_API_KEY || !incomingKey || incomingKey !== JARVIS_API_KEY) {
+    return NextResponse.json({ ok: false, error: 'missing_or_invalid_api_key' }, { status: 401 });
+  }
+
+  try {
+    // import any recent journal rows
+    await importFromJournal(200);
+
+    const batchSize = 10;
+    const pending = await fetchPendingUpdates(batchSize);
+
+    if (!pending || pending.length === 0) {
+      return NextResponse.json({ ok: true, processed: 0, message: 'no_pending' }, { status: 200 });
+    }
+
+    const results = [];
+    for (const row of pending) {
+      try {
+        const r = await processUpdate(row);
+        results.push({ id: row.id, update_id: row.update_id, result: r });
+      } catch (e) {
+        results.push({ id: row.id, update_id: row.update_id, result: { ok: false, error: String(e) } });
+      }
+    }
+
+    return NextResponse.json({ ok: true, processed: results.length, results }, { status: 200 });
+  } catch (e) {
+    console.error('processPending error:', e);
+    return NextResponse.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
+  }
+}
