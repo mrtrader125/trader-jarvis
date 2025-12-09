@@ -1,9 +1,10 @@
 // src/lib/time.ts
-// Time helper: returns ISO, human and phase (morning/afternoon/evening/night)
+// Time helper: returns ISO, human, and detailed fields including timeString & dateString.
 // Default timezone Asia/Kolkata; you can pass user's timezone when available.
 
 export function getNowInfo(timezone = "Asia/Kolkata") {
   // Build a Date object set to the target timezone using Intl
+  // Use toLocaleString with the timezone to get correct local values
   const nowStr = new Date().toLocaleString("en-US", { timeZone: timezone });
   const now = new Date(nowStr);
 
@@ -15,13 +16,17 @@ export function getNowInfo(timezone = "Asia/Kolkata") {
   else if (hour >= 17 && hour < 21) phase = "evening";
   else phase = "night";
 
-  // human friendly
+  // human friendly (full date + time)
   const human = now.toLocaleString("en-US", {
     timeZone: timezone,
     dateStyle: "medium",
     timeStyle: "short",
   });
 
-  return { iso, hour, phase, human, timezone };
+  // explicit pieces used in other code (fixes build error)
+  const timeString = now.toLocaleTimeString("en-US", { timeZone: timezone, timeStyle: "short" });
+  const dateString = now.toLocaleDateString("en-US", { timeZone: timezone, dateStyle: "medium" });
+
+  return { iso, hour, phase, human, timezone, timeString, dateString };
 }
 export type NowInfo = ReturnType<typeof getNowInfo>;
