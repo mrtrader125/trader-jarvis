@@ -7,8 +7,9 @@
  * - Provides: embedText, saveMemory, upsertMemoryEmbedding, getRelevantMemories,
  *   fetchRelevantMemories (compat wrapper), saveConversation, summarizeIfNeeded,
  *   writeJournal, getMemoryById
- * - New: buildPromptWithMemory(userId, instruction, convoHistory, memoryLimit)
- *         returns { prompt: string, memories: MemoryRow[] }
+ * - New/updated: buildPromptWithMemory supports both:
+ *     a) positional: (userId, instruction, convoHistory?, memoryLimit?) => { prompt, memories }
+ *     b) compat object: ({ nowInfo, memorySummary, lastAnswersForQuestions }) => string
  *
  * NOTE: Replace placeholder embedText with your actual embedding provider.
  */
@@ -226,29 +227,68 @@ export async function getMemoryById(memoryId: string) {
 
 /**
  * buildPromptWithMemory
- * - Fetches recent memories and composes a combined system+memory+history prompt string.
- * - Returns { prompt, memories } so caller can persist provenance if needed.
  *
- * Parameters:
- *  - userId: string
- *  - instruction: string (user instruction or query)
- *  - convoHistory: array of messages (optional) [{ role, content, ts }]
- *  - memoryLimit: number (how many memories to fetch)
+ * Two usable call styles:
+ *
+ * 1) Positional (current preferred):
+ *    buildPromptWithMemory(userId: string, instruction: string, convoHistory?: Message[], memoryLimit?: number)
+ *    -> returns Promise<{ prompt: string; memories: MemoryRow[] }>
+ *
+ * 2) Compatibility object (older callers expect this):
+ *    buildPromptWithMemory({ nowInfo, memorySummary, lastAnswersForQuestions })
+ *    -> returns Promise<string>    (only the composed prompt string)
+ *
+ * The function auto-detects the signature and returns the appropriate shape.
  */
-export async function buildPromptWithMemory(
-  userId: string,
-  instruction: string,
-  convoHistory: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[] = [],
-  memoryLimit: number = 6
-): Promise<{ prompt: string; memories: MemoryRow[] }> {
-  // Load persona/system prompt from jarvis-persona if available (do not import here to avoid circulars)
-  // Many callers will already add persona; to be safe, include a minimal header.
+export async function buildPromptWithMemory(...args: any): Promise<any> {
+  // Compat object detection: single arg with nowInfo or memorySummary
+  if (args.length === 1 && typeof args[0] === 'object' && (args[0].nowInfo || args[0].memorySummary)) {
+    const opts = args[0] as {
+      nowInfo?: any;
+      memorySummary?: string | null;
+      lastAnswersForQuestions?: Record<string, { lastAnswer: string | null; lastAt?: string | null }>;
+    };
+
+    const nowInfo = opts.nowInfo ?? null;
+    const memorySummary = opts.memorySummary ?? null;
+    const lastAnswersForQuestions = opts.lastAnswersForQuestions ?? null;
+
+    const personaHeader = `SYSTEM: JARVIS — concise, competent, mildly witty. Use stored memory when relevant. For numeric calcs use deterministic math engine.`;
+
+    const parts: string[] = [personaHeader];
+
+    if (nowInfo) {
+      parts.push(`TIME: ${JSON.stringify(nowInfo)}`);
+    }
+
+    parts.push('\n\n-- Memory summary --\n' + (memorySummary ? String(memorySummary) : 'No memory summary available.'));
+
+    if (lastAnswersForQuestions) {
+      const qText = Object.entries(lastAnswersForQuestions)
+        .map(([k, v]) => `${k}: lastAnswer=${String(v.lastAnswer ?? 'null')} lastAt=${String(v.lastAt ?? 'null')}`)
+        .join('\n');
+      parts.push('\n\n-- Last answers --\n' + (qText || 'none'));
+    }
+
+    parts.push('\n\n-- Rules --\n- Always route numeric calculations to the deterministic math engine.\n- If fact is not in memory, offer to run a check.');
+
+    const prompt = parts.join('\n\n');
+    return prompt; // compat: return string
+  }
+
+  // Positional mode
+  const userId: string = args[0];
+  const instruction: string = args[1] ?? '';
+  const convoHistory: { role: 'user' | 'assistant' | 'system'; content: string; ts?: string }[] = args[2] ?? [];
+  const memoryLimit: number = typeof args[3] === 'number' ? args[3] : 6;
+
+  // Minimal persona header (callers may also prepend full persona)
   const personaHeader = `SYSTEM: JARVIS — concise, competent, mildly witty. Use stored memory when relevant. For numeric calcs use deterministic math engine.`;
 
-  // 1) fetch memory rows (positional args)
+  // fetch memory rows (positional args)
   const memories = await getRelevantMemories(userId, null, null, memoryLimit);
 
-  // 2) map to readable memory text
+  // map to readable memory text
   const memoryTexts = memories.map((m) => {
     if (!m) return '';
     if (typeof m.content === 'string') return m.content;
@@ -259,13 +299,11 @@ export async function buildPromptWithMemory(
     return String(m.content ?? m.title ?? '');
   });
 
-  // 3) session history snippet
   const historyText = (convoHistory || [])
     .slice(-6)
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join('\n');
 
-  // 4) compose final prompt
   const parts = [
     personaHeader,
     '\n\n-- Retrieved memories (most recent first) --\n' + (memoryTexts.length ? memoryTexts.join('\n---\n') : 'No relevant memories found.'),
