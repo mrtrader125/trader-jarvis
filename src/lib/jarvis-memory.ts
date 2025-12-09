@@ -2,12 +2,12 @@
 /**
  * jarvis-memory.ts
  *
- * Lightweight Supabase-based memory helpers for Jarvis.
- * - Provides getRelevantMemories (supports signature used in summarizer)
- * - Provides saveConversation, writeJournal, saveMemory, upsertMemoryEmbedding, embedText stub
- * - Exports fetchRelevantMemories as an alias for backwards compatibility
+ * Supabase-based memory helpers for Jarvis.
+ * - getRelevantMemories(...) returns MemoryRow[]
+ * - fetchRelevantMemories(...) (compatibility) returns items shaped for summarizer:
+ *     { id?, text: string, type?: string }[]
  *
- * NOTE: This file is intentionally dependency-light and uses the project's
+ * This file is intentionally dependency-light and uses the project's
  * Supabase server client factory at "@/lib/supabase/server".
  */
 
@@ -52,12 +52,8 @@ function supabaseClient() {
  * - Returns a vector (array of numbers) or null if embedding not available.
  */
 export async function embedText(text: string): Promise<number[] | null> {
-  // Placeholder: if you have an embeddings provider, call it here and return vector.
-  // e.g., call OpenAI/your-embed-service and return vector numbers.
-  // For now, return null to indicate embeddings are not present.
   try {
     if (!text) return null;
-    // Minimal deterministic fallback: hash characters to small vector (not for real similarity)
     const v = new Array(8).fill(0).map((_, i) => (text.charCodeAt(i % text.length) || 0) % 100 / 100);
     return v;
   } catch (e) {
@@ -129,7 +125,7 @@ export async function getRelevantMemories(
   const supabase = supabaseClient();
 
   try {
-    let query = supabase
+    let query: any = supabase
       .from('memories')
       .select('*')
       .eq('user_id', userId)
@@ -155,8 +151,35 @@ export async function getRelevantMemories(
   }
 }
 
-// Backwards-compatible alias expected by older code
-export const fetchRelevantMemories = getRelevantMemories;
+/**
+ * fetchRelevantMemories (compatibility wrapper)
+ * The summarizer expects items shaped as: { id?, text: string, type?: string }[]
+ * Map MemoryRow -> this shape, deriving 'text' from memory.content if possible.
+ */
+export async function fetchRelevantMemories(
+  userId: string,
+  tagFilter: string[] | null = null,
+  daysRange: number | null = null,
+  limit: number = 50
+): Promise<{ id?: any; text: string; type?: string }[]> {
+  const rows = await getRelevantMemories(userId, tagFilter, daysRange, limit);
+
+  return rows.map((r) => {
+    // Determine a text field from common shapes of content
+    let text = '';
+    if (!r.content) {
+      text = r.title ?? '';
+    } else if (typeof r.content === 'string') {
+      text = r.content;
+    } else if (typeof r.content === 'object') {
+      // common shape: { text: "...", body: "...", note: "..." }
+      text = r.content.text ?? r.content.body ?? r.content.note ?? r.title ?? JSON.stringify(r.content);
+    } else {
+      text = String(r.content);
+    }
+    return { id: r.id, text: String(text ?? ''), type: r.type ?? undefined };
+  });
+}
 
 /**
  * saveConversation
@@ -196,7 +219,6 @@ export async function summarizeIfNeeded(conversation: ConversationRow): Promise<
   try {
     const text = (conversation.messages ?? []).map((m: any) => `${m.role}: ${m.content}`).join('\n');
     if (text.length < 800) return null;
-    // Very small heuristic summary (first 300 chars)
     return text.slice(0, 300) + (text.length > 300 ? '...' : '');
   } catch (e) {
     console.warn('summarizeIfNeeded error:', e);
