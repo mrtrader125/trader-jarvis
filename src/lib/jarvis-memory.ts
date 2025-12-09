@@ -1,8 +1,8 @@
 // src/lib/jarvis-memory.ts
 // Unified memory helper for Jarvis.
-// - Named exports: fetchMemoryForUser, fetchRelevantMemories, saveMemory, saveConversation
-// - Default export: memoryLib { fetchMemoryForUser, fetchRelevantMemories, saveMemory, saveConversation }
-// This file is server-side only (uses Supabase server client).
+// - Named exports: fetchMemoryForUser, fetchRelevantMemories, saveMemory, saveConversation, writeJournal
+// - Default export: memoryLib { ... }
+// Server-only helpers using Supabase server client.
 
 import { createClient } from "./supabase/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -22,15 +22,10 @@ export type ConversationMessage = {
   ts?: string;
 };
 
-async function getSupabaseClient(maybeClient?: ReturnType<typeof createClient> | undefined) {
-  if (maybeClient) return maybeClient;
-  return createClient();
-}
+/* -------------------------
+   Basic memory functions
+   ------------------------- */
 
-/**
- * fetchMemoryForUser(supabase, userId, opts)
- * or fetchMemoryForUser(userId, opts)
- */
 export async function fetchMemoryForUser(
   supabaseOrUserId: ReturnType<typeof createClient> | string,
   maybeUserId?: string | { limit?: number },
@@ -72,11 +67,10 @@ export async function fetchMemoryForUser(
   }
 }
 
-/**
- * fetchRelevantMemories:
- * Flexible signature to match calling code across the project:
- * Accepts numeric maxAgeDays and limit parameters as well.
- */
+/* -------------------------
+   Flexible relevant-memory fetcher
+   ------------------------- */
+
 export async function fetchRelevantMemories(
   supabaseOrUserId: ReturnType<typeof createClient> | string,
   maybeUserIdOrQuery?: string | number | { query?: string; limit?: number },
@@ -161,9 +155,10 @@ export async function fetchRelevantMemories(
   }
 }
 
-/**
- * saveMemory(userId, payload)
- */
+/* -------------------------
+   saveMemory
+   ------------------------- */
+
 export async function saveMemory(userId: string, payload: { summary: string; data?: any; importance?: number }) {
   try {
     const supabase = createClient();
@@ -185,12 +180,10 @@ export async function saveMemory(userId: string, payload: { summary: string; dat
   }
 }
 
-/**
- * saveConversation(payload)
- * - Saves a conversation transcript for a user.
- * - Accepts { userId, messages, summary, meta? }
- * - Inserts into 'conversations' table (fallback to 'jarvis_conversations' if first insert fails).
- */
+/* -------------------------
+   saveConversation
+   ------------------------- */
+
 export async function saveConversation(payload: {
   userId: string;
   messages: ConversationMessage[];
@@ -207,10 +200,8 @@ export async function saveConversation(payload: {
       created_at: new Date().toISOString(),
     };
 
-    // Try insert into 'conversations'
     let res = await supabase.from("conversations").insert([row]);
     if (res.error) {
-      // Try fallback table name
       console.warn("saveConversation: insert to 'conversations' failed, trying 'jarvis_conversations'", res.error);
       const res2 = await supabase.from("jarvis_conversations").insert([row]);
       if (res2.error) {
@@ -226,12 +217,50 @@ export async function saveConversation(payload: {
   }
 }
 
-// default export expected by some modules
+/* -------------------------
+   writeJournal
+   ------------------------- */
+
+export async function writeJournal(userId: string, payload: any, source?: string) {
+  try {
+    const supabase = createClient();
+    const row = {
+      user_id: userId,
+      event: payload?.event ?? payload?.type ?? "event",
+      payload,
+      source: source ?? null,
+      created_at: new Date().toISOString(),
+    };
+
+    // Primary table name 'journal'
+    let res = await supabase.from("journal").insert([row]);
+    if (res.error) {
+      // fallback to 'jarvis_journal'
+      console.warn("writeJournal: insert to 'journal' failed, trying 'jarvis_journal'", res.error);
+      const res2 = await supabase.from("jarvis_journal").insert([row]);
+      if (res2.error) {
+        console.warn("writeJournal: fallback insert failed", res2.error);
+        return false;
+      }
+      return true;
+    }
+    return true;
+  } catch (e) {
+    console.warn("writeJournal failed", e);
+    return false;
+  }
+}
+
+/* -------------------------
+   default export object
+   ------------------------- */
+
 const memoryLib = {
   fetchMemoryForUser,
   fetchRelevantMemories,
   saveMemory,
   saveConversation,
+  writeJournal,
 };
 
 export default memoryLib;
