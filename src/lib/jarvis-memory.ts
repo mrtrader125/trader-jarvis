@@ -30,7 +30,9 @@ export type MemoryRow = {
 
 export type ConversationRow = {
   id?: string;
-  user_id: string;
+  // Accept both naming styles so callers using camelCase or snake_case work.
+  userId?: string;
+  user_id?: string;
   messages: any[];
   summary?: string;
   last_active?: string;
@@ -159,11 +161,16 @@ export const fetchRelevantMemories = getRelevantMemories;
 /**
  * saveConversation
  * Save a conversation snapshot to conversations table.
+ * Accepts either `userId` (camelCase) or `user_id` (snake_case) and normalizes to `user_id`.
  */
 export async function saveConversation(row: ConversationRow) {
   const supabase = supabaseClient();
+
+  // Normalize user id from either camelCase or snake_case
+  const userId = (row.userId ?? row.user_id ?? 'unknown') as string;
+
   const payload = {
-    user_id: row.user_id,
+    user_id: userId,
     messages: row.messages ?? [],
     summary: row.summary ?? null,
     last_active: row.last_active ?? new Date().toISOString(),
