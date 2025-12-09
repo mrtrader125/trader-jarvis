@@ -10,6 +10,8 @@ import {
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 
+import FormData from "form-data"; // npm install form-data when running locally
+
 export const runtime = "nodejs";
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -87,54 +89,74 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
+/** Sends simple text message to Telegram */
 async function sendTelegramText(chatId: number, text: string) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
-    return;
+    return { ok: false, error: "missing_token" };
   }
 
-  await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    }
-  );
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      }),
+    });
+    const json = await res.json();
+    return { ok: res.ok, result: json };
+  } catch (err: any) {
+    console.error("sendTelegramText error:", err);
+    return { ok: false, error: String(err) };
+  }
 }
 
-async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
+/** Sends voice audio buffer to Telegram as voice note */
+async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN for voice send");
-    return;
+    return { ok: false, error: "missing_token" };
   }
 
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  const blob = new Blob([audio], { type: "audio/ogg" });
-  // @ts-ignore Node FormData typing sometimes differs, but fetch in edge/node should accept it
-  form.append("voice", blob, "jarvis.ogg");
+  try {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    // append Buffer as file
+    form.append("voice", audioBuffer, {
+      filename: "jarvis.ogg",
+      contentType: "audio/ogg",
+    } as any);
 
-  await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
-    {
+    // form.getHeaders() needed for Node to set the multipart boundary
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`, {
       method: "POST",
+      body: form as any,
       // @ts-ignore
-      body: form,
-    }
-  );
+      headers: form.getHeaders ? form.getHeaders() : undefined,
+    });
+
+    const json = await res.json();
+    return { ok: res.ok, result: json };
+  } catch (err: any) {
+    console.error("sendTelegramVoice error:", err);
+    return { ok: false, error: String(err) };
+  }
 }
 
-async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
+/** Use Deepgram (or alternative) to synthesize TTS; returns Buffer or null */
+async function synthesizeTTS(text: string): Promise<Buffer | null> {
   if (!DEEPGRAM_API_KEY) {
-    // TTS optional — don't fail if missing
-    console.error("Missing DEEPGRAM_API_KEY");
+    // optional: do not fail the main flow if TTS key missing
+    console.warn("Missing DEEPGRAM_API_KEY — skipping TTS");
     return null;
   }
 
-  const res = await fetch(
-    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
-    {
+  try {
+    const res = await fetch("https://api.deepgram.com/v1/speak?model=aura-asteria-en", {
       method: "POST",
       headers: {
         Authorization: `Token ${DEEPGRAM_API_KEY}`,
@@ -142,15 +164,44 @@ async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
         Accept: "audio/ogg",
       },
       body: JSON.stringify({ text }),
-    }
-  );
+    });
 
-  if (!res.ok) {
-    console.error("Deepgram TTS error:", await res.text());
+    if (!res.ok) {
+      console.error("Deepgram TTS error:", await res.text());
+      return null;
+    }
+
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab);
+  } catch (err: any) {
+    console.error("synthesizeTTS exception:", err);
     return null;
   }
+}
 
-  return await res.arrayBuffer();
+/** Heuristic detection: user answered with an instrument/setup word */
+function likelyAnswersSetupQuestion(text?: string | null) {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  const setupWords = [
+    "gold",
+    "silver",
+    "nifty",
+    "banknifty",
+    "btc",
+    "bitcoin",
+    "eth",
+    "ethereum",
+    "eurusd",
+    "usd",
+    "usdjpy",
+    "audusd",
+    "nasdaq",
+    "spy",
+    "tesla",
+    "goog",
+  ];
+  return setupWords.some((w) => q.includes(w));
 }
 
 export async function POST(req: NextRequest) {
@@ -158,19 +209,28 @@ export async function POST(req: NextRequest) {
     const update = (await req.json()) as TelegramUpdate;
     const message = update.message;
 
+    // ignore non-text updates
     if (!message || !message.text) {
       return NextResponse.json({ ok: true });
     }
 
     const chatId = message.chat.id;
     const userText = message.text;
-    const sentAtIso = new Date(
-      (message.date ?? Math.floor(Date.now() / 1000)) * 1000
-    ).toISOString();
+    const sentAtIso = new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
 
     const supabase = createClient();
 
-    // --- Profile ---
+    // Persist telegram_chat_id on profile (so reminders and other server actions know where to send)
+    try {
+      const { error } = await supabase
+        .from("jarvis_profile")
+        .upsert({ user_id: "single-user", telegram_chat_id: chatId }, { onConflict: "user_id" });
+      if (error) console.error("Failed to upsert telegram_chat_id:", error.message || error);
+    } catch (err) {
+      console.error("Exception upserting telegram_chat_id:", err);
+    }
+
+    // Load profile
     let profile: any = null;
     try {
       const { data, error } = await supabase
@@ -188,21 +248,17 @@ export async function POST(req: NextRequest) {
       console.error("Exception loading jarvis_profile:", err);
     }
 
-    // --- Finance snapshot ---
+    // Finance snapshot & snippets
     const finance = await loadFinance(supabase);
+    const financeSnippet = buildFinanceContextSnippet(finance);
 
     const timezone: string = profile?.timezone || "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
     const displayName = profile?.display_name || "Bro";
-    const bio =
-      profile?.bio ||
-      "Disciplined trader building systems to control impulses and grow steadily.";
-    const mainGoal =
-      profile?.main_goal ||
-      "Become a consistently profitable, rule-based trader.";
-    const currentFocus =
-      profile?.current_focus || "December: Discipline over profits.";
+    const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
+    const mainGoal = profile?.main_goal || "Become a consistently profitable, rule-based trader.";
+    const currentFocus = profile?.current_focus || "Discipline over profits.";
 
     const typicalWake = profile?.typical_wake_time || "06:30";
     const typicalSleep = profile?.typical_sleep_time || "23:30";
@@ -213,21 +269,17 @@ export async function POST(req: NextRequest) {
     const empathy = profile?.empathy_level ?? 7;
     const humor = profile?.humor_level ?? 5;
 
-    const financeSnippet = buildFinanceContextSnippet(finance);
-
-    // --- 0) Time questions (no LLM) ---
+    // 0) Time-only question handled locally (no LLM call)
     if (isTimeQuestion(userText)) {
       const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
-
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
       if (audio) await sendTelegramVoice(chatId, audio);
-
       return NextResponse.json({ ok: true });
     }
 
-    // --- 0.5) Percent-of-target questions: deterministic math only ---
+    // 0.5) Percent-of-target deterministic math handled locally
     if (isPercentOfTargetQuestion(userText)) {
       const reply = buildPercentOfTargetAnswerFromText(userText);
       if (reply) {
@@ -238,12 +290,18 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // --- 1) Build Knowledge Center context from your Data Center ---
+    // 0.6) If user likely answered an earlier "which setup" with an instrument, confirm
+    if (likelyAnswersSetupQuestion(userText)) {
+      const short = `Got it — ${userText}. Give me account/risk numbers if you want immediate analysis.`;
+      await sendTelegramText(chatId, short);
+      const shortAudio = await synthesizeTTS(short);
+      if (shortAudio) await sendTelegramVoice(chatId, shortAudio);
+      return NextResponse.json({ ok: true });
+    }
+
+    // 1) Knowledge Center context
     const intentTags = detectIntentTags(userText);
-    const knowledgeBlocks = await buildKnowledgeContext({
-      intentTags,
-      maxItems: 8,
-    });
+    const knowledgeBlocks = await buildKnowledgeContext({ intentTags, maxItems: 8 });
 
     const knowledgeSection =
       knowledgeBlocks.length === 0
@@ -258,7 +316,7 @@ ${b.instructions ? `How Jarvis must use this:\n${b.instructions}\n` : ""}`
             )
             .join("\n");
 
-    // --- 2) Build system prompt: profile + finance + time + knowledge + protocol ---
+    // 2) Build system prompt
     const systemPrompt = `
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
@@ -296,74 +354,17 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 ${financeSnippet}
 
 USER TEACHINGS (KNOWLEDGE CENTER):
-The user has manually defined the following rules, concepts, formulas, and stories.
-These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math or the laws of reality.
-
 ${knowledgeSection}
 
 CONVERSATION & LISTENING (TELEGRAM):
-
-1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
-   - Do NOT lecture.
-   - Ask a brief clarifying question to understand exactly what they meant.
-
-2) For trading/math questions where the server has NOT already calculated the result:
-   - Listen carefully, restate key numbers briefly, then answer.
-   - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
-   - Keep coaching short and specifically tied to the numbers they gave you.
-
-3) Coaching style:
-   - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
-   - For example, remind him that a calm monthly return close to his "safe monthly return percent"
-     can already cover his living costs, so he doesn't need to gamble today.
-   - Avoid generic speeches; stay tightly connected to his actual question and context.
-
-MATH & LISTENING PROTOCOL (STRICT):
-
-1) ALWAYS extract the key numbers the user gives:
-   - account size(s)
-   - profit/loss amounts
-   - target percentages
-   - evaluation rules (daily max loss, total max loss, target, etc.)
-
-2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
-   - If the user gives numbers or asks "how much", "how many", 
-     "what percent", "how far from target", ALWAYS answer with the 
-     raw calculation FIRST.
-   - Format answers like this:
-       • Result summary (1 line)
-       • Tiny breakdown (1–2 lines max)
-       • Then OPTIONAL coaching (1 line max)
-
-3) NEVER GUESS NUMBERS.
-   - If something is unclear, ask ONE clarifying question.
-   - DO NOT assume the initial capital if the user did not say it.
-
-4) WHEN THE USER PROVIDES A CORRECTION:
-   - Immediately apologize briefly.
-   - Restate the corrected numbers.
-   - Recalculate CORRECTLY.
-   - Provide the clean updated answer BEFORE ANY coaching.
-
-5) COACHING RULE:
-   - Coaching must always come AFTER the numeric answer.
-   - Coaching must be short (1–2 lines max).
-   - Coaching MUST relate directly to the user's numbers and goal.
-   - DO NOT give generic lectures.
-
-6) STRICT PRIORITY ORDER:
-   (1) Listen and extract numbers  
-   (2) Compute  
-   (3) Present result  
-   (4) Optional coaching  
-
-Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
-Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
+- Be strict but caring; always extract numbers before coaching.
+- For actionable requests (reminders, alerts) produce a JSON action object as described in system instructions (server parses it).
+- Follow the MATH & LISTENING PROTOCOL (STRICT) from the user's Knowledge Center.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
 
+    // 3) Call Groq / LLM
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: [
@@ -373,19 +374,35 @@ Use the Knowledge Center rules as the user's personal doctrine whenever relevant
       stream: false,
     });
 
-    const rawReply =
-      completion.choices?.[0]?.message?.content || "Got it, Bro.";
-
+    const rawReply = completion.choices?.[0]?.message?.content || "Got it, Bro.";
     const replyText = stripSentAtPrefix(rawReply);
 
+    // 4) Send reply text and optional voice
     await sendTelegramText(chatId, replyText);
-
     const audio = await synthesizeTTS(replyText);
     if (audio) await sendTelegramVoice(chatId, audio);
+
+    // 5) (optional) Log to table for analytics — do not block response if logging fails
+    (async () => {
+      try {
+        await supabase.from("jarvis_conversation_logs").insert([
+          {
+            user_id: "single-user",
+            channel: "telegram",
+            incoming: { text: userText, sent_at: sentAtIso },
+            outgoing: { text: replyText, model: process.env.GROQ_MODEL || "unknown" },
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      } catch (e) {
+        console.warn("Failed to log conversation (non-blocking):", e);
+      }
+    })();
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error("TELEGRAM WEBHOOK ERROR:", err);
+    // return ok=true to avoid Telegram retry storms; optionally notify admin in production
     return NextResponse.json({ ok: true });
   }
 }
