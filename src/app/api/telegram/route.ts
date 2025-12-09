@@ -1,4 +1,4 @@
-// src/app/api/telegram/route.ts
+// src/app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { groqClient } from "@/lib/groq";
@@ -10,22 +10,17 @@ import {
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
 
-import FormData from "form-data";
-
 export const runtime = "nodejs";
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-
-type TelegramUpdate = {
-  message?: {
-    message_id: number;
-    chat: { id: number };
-    text?: string;
-    date?: number;
-  };
+/** Types */
+type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+  createdAt?: string;
+  created_at?: string;
 };
 
+/** Utility: detect simple time questions */
 function isTimeQuestion(text?: string | null) {
   if (!text) return false;
   const q = text.toLowerCase();
@@ -39,10 +34,7 @@ function isTimeQuestion(text?: string | null) {
   );
 }
 
-function stripSentAtPrefix(text: string) {
-  return text.replace(/^\s*\[sent_at:[^\]]*\]\s*/i, "");
-}
-
+/** Simple intent tagger used to fetch relevant Knowledge Center blocks */
 function detectIntentTags(text?: string | null): string[] {
   if (!text) return ["general"];
   const q = text.toLowerCase();
@@ -51,12 +43,12 @@ function detectIntentTags(text?: string | null): string[] {
   if (
     q.includes("trade") ||
     q.includes("trading") ||
-    q.includes("chart") ||
     q.includes("entry") ||
     q.includes("stop loss") ||
     q.includes("risk") ||
     q.includes("prop firm") ||
-    q.includes("evaluation")
+    q.includes("evaluation") ||
+    q.includes("chart")
   ) {
     tags.push("trading");
   }
@@ -78,7 +70,6 @@ function detectIntentTags(text?: string | null): string[] {
     q.includes("salary") ||
     q.includes("expenses") ||
     q.includes("freedom") ||
-    q.includes("worry free") ||
     q.includes("runway") ||
     q.includes("minimum required")
   ) {
@@ -89,25 +80,50 @@ function detectIntentTags(text?: string | null): string[] {
   return tags;
 }
 
-/** Sends simple text message to Telegram (safe error extraction) */
-async function sendTelegramText(chatId: number, text: string) {
-  if (!TELEGRAM_BOT_TOKEN) {
+/** Helper: parse numeric chat id candidates safely */
+function parseChatId(candidate: any): number | null {
+  if (candidate === null || candidate === undefined) return null;
+  if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  if (typeof candidate === "string") {
+    const trimmed = candidate.trim();
+    if (/^-?\d+$/.test(trimmed)) {
+      try {
+        return Number(trimmed);
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+/** Send message to Telegram using bot token; returns { ok, result|error, raw? } with human-friendly error
+ *  NOTE: this function expects a numeric chatId (validated) to avoid "chat not found" errors */
+async function sendTelegramText(chatIdNum: number, text: string) {
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
     return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
   }
 
+  if (!chatIdNum && chatIdNum !== 0) {
+    console.error("Missing numeric chat id for Telegram send");
+    return { ok: false, error: "Missing chat id" };
+  }
+
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: chatId,
+        chat_id: chatIdNum,
         text,
         parse_mode: "Markdown",
         disable_web_page_preview: true,
       }),
     });
 
+    // parse response safely
     let json: any = null;
     try {
       json = await res.json();
@@ -125,83 +141,34 @@ async function sendTelegramText(chatId: number, text: string) {
 
     return { ok: true, result: json, raw: json };
   } catch (err: any) {
-    console.error("sendTelegramText exception:", err);
+    console.error("Telegram send exception:", err);
     return { ok: false, error: String(err) };
   }
 }
 
-/** Sends voice audio buffer to Telegram as voice note */
-async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    console.error("Missing TELEGRAM_BOT_TOKEN for voice send");
-    return { ok: false, error: "missing_token" };
-  }
-
+/** Save reminder row to supabase */
+async function saveReminderToSupabase(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  sendAtIso: string,
+  message: string
+) {
   try {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    form.append("voice", audioBuffer, {
-      filename: "jarvis.ogg",
-      contentType: "audio/ogg",
-    } as any);
-
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`, {
-      method: "POST",
-      body: form as any,
-      // @ts-ignore
-      headers: form.getHeaders ? form.getHeaders() : undefined,
-    });
-
-    let json: any = null;
-    try {
-      json = await res.json();
-    } catch (parseErr) {
-      console.warn("Telegram voice response not JSON:", parseErr);
-      const txt = await res.text();
-      return { ok: res.ok, error: txt || `HTTP ${res.status}` };
+    const payload = {
+      user_id: userId,
+      send_at: sendAtIso,
+      message,
+      status: "scheduled",
+    };
+    const { data, error } = await supabase.from("jarvis_reminders").insert([payload]).select().single();
+    if (error) {
+      console.error("Error inserting reminder:", error);
+      return { ok: false, error };
     }
-
-    if (!res.ok) {
-      const desc = json?.description ?? JSON.stringify(json);
-      console.error("Telegram sendVoice error:", desc, json);
-      return { ok: false, error: desc, raw: json };
-    }
-
-    return { ok: true, result: json, raw: json };
-  } catch (err: any) {
-    console.error("sendTelegramVoice exception:", err);
+    return { ok: true, data };
+  } catch (err) {
+    console.error("Exception saving reminder:", err);
     return { ok: false, error: String(err) };
-  }
-}
-
-/** Use Deepgram (or alternative) to synthesize TTS; returns Buffer or null */
-async function synthesizeTTS(text: string): Promise<Buffer | null> {
-  if (!DEEPGRAM_API_KEY) {
-    console.warn("Missing DEEPGRAM_API_KEY — skipping TTS");
-    return null;
-  }
-
-  try {
-    const res = await fetch("https://api.deepgram.com/v1/speak?model=aura-asteria-en", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${DEEPGRAM_API_KEY}`,
-        "Content-Type": "application/json",
-        Accept: "audio/ogg",
-      },
-      body: JSON.stringify({ text }),
-    });
-
-    if (!res.ok) {
-      console.error("Deepgram TTS error:", await res.text());
-      return null;
-    }
-
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
-  } catch (err: any) {
-    console.error("synthesizeTTS exception:", err);
-    return null;
   }
 }
 
@@ -261,75 +228,15 @@ function removeFirstJsonBlock(text?: string | null): string {
   return text.trim();
 }
 
-/** Heuristic detection: user answered with an instrument/setup word */
-function likelyAnswersSetupQuestion(text?: string | null) {
-  if (!text) return false;
-  const q = text.toLowerCase();
-  const setupWords = [
-    "gold",
-    "silver",
-    "nifty",
-    "banknifty",
-    "btc",
-    "bitcoin",
-    "eth",
-    "ethereum",
-    "eurusd",
-    "usd",
-    "usdjpy",
-    "audusd",
-    "nasdaq",
-    "spy",
-    "tesla",
-    "goog",
-  ];
-  return setupWords.some((w) => q.includes(w));
-}
-
-/** Helper: parse numeric chat id candidates safely */
-function parseChatId(candidate: any): number | null {
-  if (candidate === null || candidate === undefined) return null;
-  if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
-  if (typeof candidate === "string") {
-    const trimmed = candidate.trim();
-    if (/^-?\d+$/.test(trimmed)) {
-      try {
-        return Number(trimmed);
-      } catch {
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
+/** Main handler */
 export async function POST(req: NextRequest) {
   try {
-    const update = (await req.json()) as TelegramUpdate;
-    const message = update.message;
-
-    // ignore non-text updates
-    if (!message || !message.text) {
-      return NextResponse.json({ ok: true });
-    }
-
-    const chatId = message.chat.id;
-    const userText = message.text;
-    const sentAtIso = new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
+    const body = await req.json();
+    const messages: ChatMessage[] = body?.messages ?? [];
 
     const supabase = createClient();
 
-    // Persist telegram_chat_id on profile
-    try {
-      const { error } = await supabase
-        .from("jarvis_profile")
-        .upsert({ user_id: "single-user", telegram_chat_id: chatId }, { onConflict: "user_id" });
-      if (error) console.error("Failed to upsert telegram_chat_id:", error.message || error);
-    } catch (err) {
-      console.error("Exception upserting telegram_chat_id:", err);
-    }
-
-    // Load profile
+    // --- Load profile ---
     let profile: any = null;
     try {
       const { data, error } = await supabase
@@ -347,60 +254,49 @@ export async function POST(req: NextRequest) {
       console.error("Exception loading jarvis_profile:", err);
     }
 
-    // Finance snapshot & snippets
+    // --- Load finance snapshot ---
     const finance = await loadFinance(supabase);
     const financeSnippet = buildFinanceContextSnippet(finance);
 
+    // --- Time & last message parsing ---
     const timezone: string = profile?.timezone || "Asia/Kolkata";
     const nowInfo = getNowInfo(timezone);
 
-    const displayName = profile?.display_name || "Bro";
-    const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
-    const mainGoal = profile?.main_goal || "Become a consistently profitable, rule-based trader.";
-    const currentFocus = profile?.current_focus || "Discipline over profits.";
+    const lastMessage = messages[messages.length - 1];
+    const lastUserContent = lastMessage?.role === "user" ? lastMessage.content : undefined;
 
-    const typicalWake = profile?.typical_wake_time || "06:30";
-    const typicalSleep = profile?.typical_sleep_time || "23:30";
-    const sessionStart = profile?.trading_session_start || "09:15";
-    const sessionEnd = profile?.trading_session_end || "15:30";
-
-    const strictness = profile?.strictness_level ?? 8;
-    const empathy = profile?.empathy_level ?? 7;
-    const humor = profile?.humor_level ?? 5;
-
-    // 0) Time-only question handled locally
-    if (isTimeQuestion(userText)) {
-      const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
-      const reply = stripSentAtPrefix(replyRaw);
-      await sendTelegramText(chatId, reply);
-      const audio = await synthesizeTTS(reply);
-      if (audio) await sendTelegramVoice(chatId, audio);
-      return NextResponse.json({ ok: true });
+    // 0) time question handled server-side
+    if (isTimeQuestion(lastUserContent)) {
+      const reply = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      return NextResponse.json({ reply }, { status: 200 });
     }
 
-    // 0.5) Percent-of-target deterministic math handled locally
-    if (isPercentOfTargetQuestion(userText)) {
-      const reply = buildPercentOfTargetAnswerFromText(userText);
-      if (reply) {
-        await sendTelegramText(chatId, reply);
-        const audio = await synthesizeTTS(reply);
-        if (audio) await sendTelegramVoice(chatId, audio);
-        return NextResponse.json({ ok: true });
+    // 0.5) percent-of-target math handled server-side
+    if (lastUserContent && isPercentOfTargetQuestion(lastUserContent)) {
+      const answer = buildPercentOfTargetAnswerFromText(lastUserContent);
+      if (answer) {
+        return NextResponse.json({ reply: answer }, { status: 200 });
       }
     }
 
-    // 0.6) If user likely answered an earlier "which setup" with an instrument, confirm
-    if (likelyAnswersSetupQuestion(userText)) {
-      const short = `Got it — ${userText}. Give me account/risk numbers if you want immediate analysis.`;
-      await sendTelegramText(chatId, short);
-      const shortAudio = await synthesizeTTS(short);
-      if (shortAudio) await sendTelegramVoice(chatId, shortAudio);
-      return NextResponse.json({ ok: true });
-    }
+    // 1) tag user messages with [sent_at: ...]
+    const messagesWithTime = messages.map((m) => {
+      const sentAt = m.createdAt || m.created_at || new Date().toISOString();
+      if (m.role === "user") {
+        return {
+          role: m.role,
+          content: `[sent_at: ${sentAt}] ${m.content}`,
+        };
+      }
+      return { role: m.role, content: m.content };
+    });
 
-    // 1) Knowledge Center context
-    const intentTags = detectIntentTags(userText);
-    const knowledgeBlocks = await buildKnowledgeContext({ intentTags, maxItems: 8 });
+    // 2) Knowledge Center
+    const intentTags = detectIntentTags(lastUserContent);
+    const knowledgeBlocks = await buildKnowledgeContext({
+      intentTags,
+      maxItems: 8,
+    });
 
     const knowledgeSection =
       knowledgeBlocks.length === 0
@@ -415,9 +311,48 @@ ${b.instructions ? `How Jarvis must use this:\n${b.instructions}\n` : ""}`
             )
             .join("\n");
 
-    // 2) Build system prompt
+    // 3) Build system prompt (includes server-action rules)
+    const displayName = profile?.display_name || "Bro";
+    const bio = profile?.bio || "Disciplined trader building systems to control impulses and grow steadily.";
+    const mainGoal = profile?.main_goal || "Become a consistently profitable, rule-based trader.";
+    const currentFocus = profile?.current_focus || "Discipline over profits.";
+
+    const typicalWake = profile?.typical_wake_time || "06:30";
+    const typicalSleep = profile?.typical_sleep_time || "23:30";
+    const sessionStart = profile?.trading_session_start || "09:15";
+    const sessionEnd = profile?.trading_session_end || "15:30";
+
+    const strictness = profile?.strictness_level ?? 8;
+    const empathy = profile?.empathy_level ?? 7;
+    const humor = profile?.humor_level ?? 5;
+
     const systemPrompt = `
-You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
+You are Jarvis, a long-term trading & life companion for ONE user in SINGLE-USER mode.
+You are allowed to instruct the server to perform actions (send Telegram messages, schedule reminders).
+When you need the server to perform an action, output a single JSON object (no other text in the same JSON block). Example:
+
+\`\`\`json
+{
+  "action": "send_telegram",
+  "chat_id": 123456789,
+  "text": "Bro — quick reminder: check your daily limits."
+}
+\`\`\`
+
+or
+
+\`\`\`json
+{
+  "action": "schedule_reminder",
+  "time": "2025-12-09T10:00:00.000Z",
+  "text": "Reminder: close trades and review risk."
+}
+\`\`\`
+
+Rules:
+- The model should produce the JSON object only when it truly intends to trigger a server action.
+- If both conversational reply and action are needed, prefer returning a short assistant message followed by a separate JSON action block.
+- The server will parse the first JSON object it finds and execute it.
 
 USER ID: "single-user"
 
@@ -443,73 +378,89 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 - Local: ${nowInfo.localeString}
 - Timezone: ${nowInfo.timezone}
 
-[sent_at: ...] TAG:
-- The user text may be wrapped as:
-  [sent_at: 2025-12-07T08:22:54.281Z] actual text...
-- This is METADATA ONLY. Use it to infer how long it's been since the last message.
-- NEVER print the [sent_at: ...] tag or raw ISO timestamps.
-- DO NOT invent your own [sent_at: ...] prefix in replies.
+[sent_at: ...] TAGS:
+- User messages may start with [sent_at: ISO_DATE] at the front.
+- This is metadata only. Use it to infer how long it's been since the last message.
+- NEVER print the [sent_at: ...] tag or raw ISO timestamps back to the user.
 
 ${financeSnippet}
 
 USER TEACHINGS (KNOWLEDGE CENTER):
 ${knowledgeSection}
 
-CONVERSATION & LISTENING (TELEGRAM):
-- Be strict but caring; always extract numbers before coaching.
-- For actionable requests (reminders, alerts) produce a JSON action object as described in system instructions (server parses it).
-- Follow the MATH & LISTENING PROTOCOL (STRICT) from the user's Knowledge Center.
+CONVERSATION & LISTENING:
+- Be strict but caring.
+- ALWAYS extract numbers and compute before coaching.
+- For "send to Telegram" or "remind me at ..." requests, produce a JSON action object as shown above.
 `.trim();
 
-    const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
+    const finalMessages = [
+      { role: "system" as const, content: systemPrompt },
+      ...messagesWithTime,
+    ];
 
-    // 3) Call Groq / LLM
+    // 4) Call Groq LLM
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessageForModel },
-      ],
+      messages: finalMessages,
       stream: false,
     });
 
-    const rawReply = (completion.choices?.[0]?.message?.content as string) || "Got it, Bro.";
+    const replyMessage = completion.choices?.[0]?.message as any;
 
-    // Parse action JSON if present
-    const maybeAction = extractFirstJsonObject(rawReply);
+    const replyContent =
+      typeof replyMessage?.content === "string"
+        ? replyMessage.content
+        : Array.isArray(replyMessage?.content)
+        ? replyMessage.content.map((c: any) => (typeof c === "string" ? c : c.text ?? "")).join("\n")
+        : "Sorry, I couldn't generate a response.";
+
+    // --- ACTION PARSING & HANDLING ---
+    const maybeAction = extractFirstJsonObject(replyContent);
 
     let actionResultSummary: string | null = null;
 
     if (maybeAction && maybeAction.action) {
+      const action = maybeAction.action;
       try {
-        const action = maybeAction.action;
-        // ---------- Updated send_telegram handler (safe, validated chat id) ----------
         if (action === "send_telegram") {
-          const actionText: string = maybeAction.text ?? "";
-          const modelCandidate = maybeAction.chat_id ?? null;
+          const text: string = maybeAction.text ?? "";
 
-          // 1) prefer model-provided numeric chat_id only if it's a valid integer
+          // NEW: resolve chat target safely (prefer numeric model chat_id, then profile, then env)
+          const modelCandidate = maybeAction.chat_id ?? null;
           let chatTarget = parseChatId(modelCandidate);
 
-          // 2) fallback to saved profile value (strong preference)
           if (!chatTarget && profile?.telegram_chat_id) {
             chatTarget = parseChatId(profile.telegram_chat_id);
           }
 
-          // 3) fallback to env TELEGRAM_CHAT_ID if present
           if (!chatTarget && process.env.TELEGRAM_CHAT_ID) {
             chatTarget = parseChatId(process.env.TELEGRAM_CHAT_ID);
           }
 
-          // 4) if still no chatTarget, fail with friendly message rather than calling Telegram
           if (!chatTarget) {
+            // fail gracefully — do not call Telegram with invalid id
             actionResultSummary =
               "Failed to send: no valid chat id found. Open the bot in Telegram and press Start so Jarvis can message you, or set TELEGRAM_CHAT_ID in env.";
           } else {
-            // Ensure chatTarget is a number and call sendTelegramText
-            const tg = await sendTelegramText(Number(chatTarget), String(actionText));
+            // call sendTelegramText with numeric chat id
+            const tg = await sendTelegramText(Number(chatTarget), text);
 
-            // human-friendly error string extraction
+            // log to supabase (optional telemetry)
+            try {
+              await supabase.from("jarvis_notifications").insert([
+                {
+                  user_id: "single-user",
+                  type: "telegram",
+                  payload: { action: "send_telegram", chat_id: chatTarget, text },
+                  result: tg,
+                  created_at: new Date().toISOString(),
+                },
+              ]);
+            } catch (e) {
+              console.error("Log notification error:", e);
+            }
+
             const tgError = tg.error;
             const tgErrorMsg =
               typeof tgError === "string"
@@ -519,90 +470,79 @@ CONVERSATION & LISTENING (TELEGRAM):
                 : String(tgError);
 
             actionResultSummary = tg.ok ? "Sent to Telegram." : `Telegram send failed: ${tgErrorMsg}`;
-
-            // optional telemetry logging (non-blocking)
-            try {
-              await supabase.from("jarvis_notifications").insert([
-                {
-                  user_id: "single-user",
-                  type: "telegram",
-                  payload: { action: "send_telegram", chat_id: chatTarget, text: actionText },
-                  result: tg,
-                  created_at: new Date().toISOString(),
-                },
-              ]);
-            } catch (err) {
-              console.warn("Failed to log notification:", err);
-            }
           }
-        }
-        // ---------- schedule_reminder unchanged ----------
-        else if (action === "schedule_reminder") {
+        } else if (action === "schedule_reminder") {
           const time = maybeAction.time;
           const text = maybeAction.text ?? "";
           if (!time) {
-            actionResultSummary = "Failed to schedule: missing time.";
+            console.error("schedule_reminder missing time");
+            actionResultSummary = "Failed to schedule reminder: missing time.";
           } else {
-            const saveRes = await supabase.from("jarvis_reminders").insert([
-              {
-                user_id: "single-user",
-                send_at: time,
-                message: text,
-                status: "scheduled",
-              },
-            ]);
-            actionResultSummary = saveRes.error ? `Failed to schedule: ${String(saveRes.error)}` : `Reminder scheduled for ${time}.`;
+            const saveRes = await saveReminderToSupabase(supabase, "single-user", time, text);
+            if (saveRes.ok) {
+              actionResultSummary = `Reminder scheduled for ${time}.`;
+              // immediate send if time <= now
+              try {
+                if (saveRes.data?.id && new Date(time).getTime() <= Date.now()) {
+                  const chatIdEnv = process.env.TELEGRAM_CHAT_ID;
+                  const chatIdNum = parseChatId(chatIdEnv);
+                  if (chatIdNum) {
+                    const sendRes = await sendTelegramText(chatIdNum, text);
+                    if (sendRes.ok) {
+                      await supabase
+                        .from("jarvis_reminders")
+                        .update({ status: "sent", sent_at: new Date().toISOString() })
+                        .eq("id", saveRes.data.id);
+                      actionResultSummary = `Reminder scheduled and sent immediately.`;
+                    } else {
+                      const sendErr = sendRes.error;
+                      const sendErrMsg =
+                        typeof sendErr === "string"
+                          ? sendErr
+                          : sendErr && typeof sendErr === "object"
+                          ? (sendErr.description ?? sendErr.error ?? JSON.stringify(sendErr))
+                          : String(sendErr);
+                      actionResultSummary = `Reminder scheduled but immediate send failed: ${sendErrMsg}`;
+                    }
+                  } else {
+                    actionResultSummary = `Reminder scheduled but immediate send skipped: no valid chat id in env.`;
+                  }
+                }
+              } catch (e) {
+                console.error("Immediate send for scheduled reminder failed:", e);
+              }
+            } else {
+              actionResultSummary = `Failed to schedule reminder: ${String(saveRes.error)}`;
+            }
           }
         } else {
-          actionResultSummary = `Unknown action: ${maybeAction.action}`;
+          console.log("Unknown action from model:", action);
+          actionResultSummary = `Unknown action: ${action}`;
         }
       } catch (e) {
-        console.error("Error executing action:", e);
+        console.error("Error handling action:", e);
         actionResultSummary = `Error executing action: ${String(e)}`;
       }
     }
 
-    // Remove JSON block from model reply before sending to chat
-    const assistantText = removeFirstJsonBlock(rawReply);
-    const cleanedText = stripSentAtPrefix(assistantText).trim();
+    // Remove JSON action block from assistant reply before returning to client
+    const cleanedReply = removeFirstJsonBlock(replyContent).trim();
 
-    // If model only returned JSON (cleanedText is empty), create a short confirmation message
-    let finalOutgoingText = cleanedText;
-    if (!finalOutgoingText) {
-      finalOutgoingText = actionResultSummary || "Done. I scheduled the reminder / sent the message.";
+    // If cleaned reply is empty (model only returned JSON), synthesize a confirmation reply
+    let finalReplyToClient = cleanedReply;
+    if (!finalReplyToClient) {
+      if (maybeAction && maybeAction.action) {
+        finalReplyToClient = actionResultSummary || "Action executed.";
+      } else {
+        finalReplyToClient = "Okay — I did not find anything to say.";
+      }
     }
 
-    // Send the cleaned reply to the user on Telegram
-    await sendTelegramText(chatId, finalOutgoingText);
-
-    // Try sending voice if available
-    const audio = await synthesizeTTS(finalOutgoingText).catch((e) => {
-      console.warn("TTS failed:", e);
-      return null;
-    });
-    if (audio) await sendTelegramVoice(chatId, audio);
-
-    // Log conversation row asynchronously (non-blocking)
-    (async () => {
-      try {
-        await supabase.from("jarvis_conversation_logs").insert([
-          {
-            user_id: "single-user",
-            channel: "telegram",
-            incoming: { text: userText, sent_at: sentAtIso },
-            outgoing: { text: finalOutgoingText, model: process.env.GROQ_MODEL || "unknown" },
-            created_at: new Date().toISOString(),
-          },
-        ]);
-      } catch (e) {
-        console.warn("Failed to log conversation:", e);
-      }
-    })();
-
-    return NextResponse.json({ ok: true });
-  } catch (err: any) {
-    console.error("TELEGRAM WEBHOOK ERROR:", err);
-    // return ok=true to avoid Telegram retry storms
-    return NextResponse.json({ ok: true });
+    // Return the assistant's cleaned reply to the client
+    return NextResponse.json({ reply: finalReplyToClient }, { status: 200 });
+  } catch (error: unknown) {
+    console.error("CHAT API ERROR:", error);
+    const message = error instanceof Error ? error.message : String(error);
+    return NextResponse.json({ reply: "Jarvis brain crashed: " + message }, { status: 200 });
   }
 }
