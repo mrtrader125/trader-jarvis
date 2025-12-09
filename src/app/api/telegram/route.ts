@@ -90,27 +90,55 @@ function detectIntentTags(text?: string | null): string[] {
 }
 
 /** Sends simple text message to Telegram */
-async function sendTelegramText(chatId: number, text: string) {
-  if (!TELEGRAM_BOT_TOKEN) {
+async function sendTelegramText(chatId: number | string | undefined, text: string) {
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN");
-    return { ok: false, error: "missing_token" };
+    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN" };
+  }
+
+  const CHAT_ID = chatId ?? process.env.TELEGRAM_CHAT_ID;
+  if (!CHAT_ID) {
+    console.error("Missing chat id for Telegram send");
+    return { ok: false, error: "Missing chat id" };
   }
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: chatId,
+        chat_id: CHAT_ID,
         text,
         parse_mode: "Markdown",
         disable_web_page_preview: true,
       }),
     });
-    const json = await res.json();
-    return { ok: res.ok, result: json };
+
+    // always attempt to parse JSON safely
+    let json: any = null;
+    try {
+      json = await res.json();
+    } catch (parseErr) {
+      console.warn("Telegram response not JSON:", parseErr);
+      // fallback to text
+      const txt = await res.text();
+      return { ok: res.ok, error: txt || `HTTP ${res.status}` };
+    }
+
+    if (!res.ok) {
+      // prefer the description field from Telegram response if available
+      const desc =
+        (json && (json.description || json.error || JSON.stringify(json))) ??
+        `HTTP ${res.status}`;
+      console.error("Telegram API returned error:", desc, json);
+      return { ok: false, error: desc, raw: json };
+    }
+
+    return { ok: true, result: json };
   } catch (err: any) {
-    console.error("sendTelegramText error:", err);
+    console.error("Telegram send exception:", err);
+    // err could be a network error — convert to string
     return { ok: false, error: String(err) };
   }
 }
