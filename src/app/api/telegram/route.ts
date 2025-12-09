@@ -1,5 +1,4 @@
 // trader-jarvis/src/app/api/telegram/route.ts
-
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { groqClient } from "@/lib/groq";
@@ -10,16 +9,8 @@ import {
 } from "@/lib/jarvis/math";
 import { loadFinance, buildFinanceContextSnippet } from "@/lib/jarvis/finance";
 import { buildKnowledgeContext } from "@/lib/jarvis/knowledge/context";
-import { tryCreateReminderFromText } from "@/lib/jarvis/reminders";
 
-// Preserved helpers from OLD file (tone, history, trading memory)
-import { detectToneMode, buildToneDirective } from "@/lib/jarvis/tone";
-import { loadRecentHistory, saveHistoryPair } from "@/lib/jarvis/history";
-import {
-  autoUpdateTradingMemoryFromUtterance,
-  loadTradingProfile,
-  buildTradingProfileSnippet,
-} from "@/lib/jarvis/tradingMemory";
+import FormData from "form-data"; // npm install form-data
 
 export const runtime = "nodejs";
 
@@ -52,10 +43,6 @@ function stripSentAtPrefix(text: string): string {
   return text.replace(/^\s*\[sent_at:[^\]]*\]\s*/i, "");
 }
 
-/**
- * Very simple tag detector for Knowledge Center relevance.
- * This decides which knowledge items are most relevant for this Telegram message.
- */
 function detectIntentTags(text: string | undefined | null): string[] {
   if (!text) return ["general"];
   const q = text.toLowerCase();
@@ -81,11 +68,7 @@ function detectIntentTags(text: string | undefined | null): string[] {
     q.includes("revenge") ||
     q.includes("discipline") ||
     q.includes("tilt") ||
-    q.includes("mindset") ||
-    q.includes("worried") ||
-    q.includes("worry") ||
-    q.includes("stress") ||
-    q.includes("stressed")
+    q.includes("mindset")
   ) {
     tags.push("psychology");
   }
@@ -122,7 +105,7 @@ async function sendTelegramText(chatId: number, text: string) {
   );
 }
 
-async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
+async function sendTelegramVoice(chatId: number, audioBuffer: Buffer) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error("Missing TELEGRAM_BOT_TOKEN for voice send");
     return;
@@ -130,22 +113,23 @@ async function sendTelegramVoice(chatId: number, audio: ArrayBuffer) {
 
   const form = new FormData();
   form.append("chat_id", String(chatId));
-
-  const blob = new Blob([audio], { type: "audio/ogg" });
-  // @ts-ignore Node FormData typing is a bit loose; this works at runtime
-  form.append("voice", blob, "jarvis.ogg");
+  // append Buffer as file
+  form.append("voice", audioBuffer, {
+    filename: "jarvis.ogg",
+    contentType: "audio/ogg",
+  } as any);
 
   await fetch(
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice`,
     {
       method: "POST",
-      // @ts-ignore Node FormData typing is a bit loose; this works at runtime
-      body: form,
+      body: form as any,
+      headers: form.getHeaders(),
     }
   );
 }
 
-async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
+async function synthesizeTTS(text: string): Promise<Buffer | null> {
   if (!DEEPGRAM_API_KEY) {
     console.error("Missing DEEPGRAM_API_KEY");
     return null;
@@ -169,7 +153,43 @@ async function synthesizeTTS(text: string): Promise<ArrayBuffer | null> {
     return null;
   }
 
-  return await res.arrayBuffer();
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+function lastAssistantAskedSetupFromText(text?: string) {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  return (
+    q.includes("which setup") ||
+    q.includes("which one was it") ||
+    q.includes("which setup are we talking") ||
+    q.includes("which pair") ||
+    q.includes("which instrument")
+  );
+}
+
+function likelyAnswersSetupQuestion(text: string | undefined | null) {
+  if (!text) return false;
+  const q = text.toLowerCase();
+  const setupWords = [
+    "gold",
+    "silver",
+    "nifty",
+    "banknifty",
+    "btc",
+    "ethereum",
+    "eth",
+    "eurusd",
+    "usd",
+    "usdjpy",
+    "audusd",
+    "nasdaq",
+    "spy",
+    "tesla",
+    "goog",
+  ];
+  return setupWords.some((w) => q.includes(w));
 }
 
 export async function POST(req: NextRequest) {
@@ -189,11 +209,15 @@ export async function POST(req: NextRequest) {
 
     const supabase = createClient();
 
-    // --- Attempt to update trading memory (preserve old behavior; non-fatal) ---
+    // --- Persist telegram_chat_id in profile for reminder delivery ---
     try {
-      await autoUpdateTradingMemoryFromUtterance(supabase, userText);
-    } catch (e) {
-      console.error("autoUpdateTradingMemoryFromUtterance error:", e);
+      // upsert jarvis_profile single-user with telegram_chat_id
+      const { error } = await supabase
+        .from("jarvis_profile")
+        .upsert({ user_id: "single-user", telegram_chat_id: chatId }, { onConflict: "user_id" });
+      if (error) console.error("Failed to upsert telegram_chat_id:", error.message);
+    } catch (err) {
+      console.error("Exception upserting telegram_chat_id:", err);
     }
 
     // --- Profile ---
@@ -240,97 +264,40 @@ export async function POST(req: NextRequest) {
     const humor = profile?.humor_level ?? 5;
 
     const financeSnippet = buildFinanceContextSnippet(finance);
-    const tradingProfile = await loadTradingProfile(supabase);
-    const tradingSnippet = buildTradingProfileSnippet(tradingProfile);
 
-    // --- 0) Reminder creation (Telegram) ---
-    try {
-      const reminderResult = await tryCreateReminderFromText({
-        text: userText,
-        supabase,
-        source: "telegram",
-        timezone,
-        telegramChatId: chatId,
-      });
-
-      if (reminderResult) {
-        const reply = reminderResult.confirmation;
-        await sendTelegramText(chatId, reply);
-        const audio = await synthesizeTTS(reply);
-        if (audio) await sendTelegramVoice(chatId, audio);
-
-        // Also save confirmation to history (preserve OLD behavior)
-        try {
-          await saveHistoryPair({
-            supabase,
-            channel: "telegram",
-            userText,
-            assistantText: reply,
-          });
-        } catch (e) {
-          console.error("Error saving reminder confirmation to history:", e);
-        }
-
-        return NextResponse.json({ ok: true });
-      }
-    } catch (e) {
-      console.error("tryCreateReminderFromText error:", e);
-    }
-
-    // --- 0.1) Time questions (no LLM) ---
+    // --- 0) Time questions (no LLM) ---
     if (isTimeQuestion(userText)) {
-      const replyRaw = `It's currently ${nowInfo.timeString} in our local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
+      const replyRaw = `It's currently ${nowInfo.timeString} in your local time zone, ${nowInfo.timezone} (date: ${nowInfo.dateString}).`;
       const reply = stripSentAtPrefix(replyRaw);
 
       await sendTelegramText(chatId, reply);
       const audio = await synthesizeTTS(reply);
       if (audio) await sendTelegramVoice(chatId, audio);
 
-      try {
-        await saveHistoryPair({
-          supabase,
-          channel: "telegram",
-          userText,
-          assistantText: reply,
-        });
-      } catch (e) {
-        console.error("Error saving time reply to history:", e);
-      }
-
       return NextResponse.json({ ok: true });
     }
 
-    // --- 0.2) Percent-of-target questions: deterministic math only ---
-    const percentQuestionIntent =
-      !!userText &&
-      (
-        /\bhow (much|many)\b/i.test(userText) ||
-        /\bwhat(?:'s| is)? the? (percent|%)/i.test(userText) ||
-        /\bhow (far|close)\b.*\b(target|goal)\b/i.test(userText) ||
-        /\bpercent\b/i.test(userText) ||
-        userText.trim().endsWith("?")
-      );
-
-    if (percentQuestionIntent && isPercentOfTargetQuestion(userText)) {
+    // --- 0.5) Percent-of-target questions: deterministic math only ---
+    if (isPercentOfTargetQuestion(userText)) {
       const reply = buildPercentOfTargetAnswerFromText(userText);
       if (reply) {
         await sendTelegramText(chatId, reply);
         const audio = await synthesizeTTS(reply);
         if (audio) await sendTelegramVoice(chatId, audio);
-
-        try {
-          await saveHistoryPair({
-            supabase,
-            channel: "telegram",
-            userText,
-            assistantText: reply,
-          });
-        } catch (e) {
-          console.error("Error saving percent answer to history:", e);
-        }
-
         return NextResponse.json({ ok: true });
       }
+    }
+
+    // --- Duplicate-question guard: if Jarvis just asked "which setup" and user answered with instrument, short-circuit ---
+    // We can't read the model's last message here; rely on a simple heuristic by checking recent assistant message in DB (if you store it).
+    // For now, a simple detection: if user answers with instrument-word, proactively confirm.
+    if (likelyAnswersSetupQuestion(userText)) {
+      // short confirm and continue
+      const short = `Got it — ${userText}. Give me account/risk numbers if you want immediate analysis.`;
+      await sendTelegramText(chatId, short);
+      const shortAudio = await synthesizeTTS(short);
+      if (shortAudio) await sendTelegramVoice(chatId, shortAudio);
+      return NextResponse.json({ ok: true });
     }
 
     // --- 1) Build Knowledge Center context from your Data Center ---
@@ -357,42 +324,8 @@ ${
             )
             .join("\n");
 
-    // --- 2) Tone engine + style preferences for Telegram (preserve OLD behavior) ---
-    const toneMode = detectToneMode(userText || "", "telegram");
-    const toneDirective = buildToneDirective(toneMode, "telegram");
-
-    const styleBlock = `
-[User style preferences - Telegram]
-- This channel is for quick, natural conversation.
-- Short texts like "Bro", "Ok", "Yup" should get short, casual replies, not lectures.
-- Use casual language, call him "Bro", and feel like a real friend.
-- Only go deep or long when he writes something longer, emotional, or explicitly asks.
-- When summarizing or listing things about him, avoid "*" star bullets unless he asks; use numbered lists or simple dashes.
-`;
-
-    // --- 2.5) Load recent shared history (web + telegram) (preserve OLD behavior) ---
-    let historyMessages: { role: "user" | "assistant"; content: string }[] = [];
-    try {
-      const recentHistory = await loadRecentHistory({
-        supabase,
-        userId: "single-user",
-        limit: 10,
-      });
-
-      historyMessages = recentHistory.map((h) => ({
-        role: h.role as "user" | "assistant",
-        content: h.content,
-      }));
-    } catch (e) {
-      console.error("Error loading recent history:", e);
-      historyMessages = [];
-    }
-
-    // --- 3) Build system prompt: profile + finance + time + knowledge + protocol ---
+    // --- 2) Build system prompt: profile + finance + time + knowledge + protocol ---
     const systemPrompt = `
-${toneDirective}
-${styleBlock}
-
 You are Jarvis, a long-term trading & life companion for ONE user, talking over Telegram.
 
 USER ID: "single-user"
@@ -428,8 +361,6 @@ Current time (FOR INTERNAL REASONING ONLY, DO NOT SAY THIS UNLESS THE USER ASKS 
 
 ${financeSnippet}
 
-${tradingSnippet}
-
 USER TEACHINGS (KNOWLEDGE CENTER):
 The user has manually defined the following rules, concepts, formulas, and stories.
 These are HIGH PRIORITY and should guide your answers. Obey them unless they clearly conflict with basic logic or math or the laws of reality.
@@ -438,36 +369,71 @@ ${knowledgeSection}
 
 CONVERSATION & LISTENING (TELEGRAM):
 
-1) Short, casual messages:
-   - If the user sends a one- or two-word message ("Bro", "Okay", "Yup", etc.), reply in a very short, casual way.
-   - Ask a small follow-up question only when he clearly opens a topic. Do NOT start a long lecture.
-
-2) If the user replies with a short negation like "no", "nope", "that's not what I meant":
+1) If the user replies with a short negation like "no", "nope", "that's not what I meant":
    - Do NOT lecture.
    - Ask a brief clarifying question to understand exactly what they meant.
 
-3) For trading/math questions where the server has NOT already calculated the result:
+2) For trading/math questions where the server has NOT already calculated the result:
    - Listen carefully, restate key numbers briefly, then answer.
    - If the user corrects you ("you're wrong bro"), apologize briefly, restate their numbers, and recompute carefully.
    - Keep coaching short and specifically tied to the numbers they gave you.
 
-4) Coaching style:
+3) Coaching style:
    - Strict but caring. Discipline over random trades.
-   - Use the finance snapshot and trading memory when he talks about risk, capital, or feeling rushed.
+   - Use the finance snapshot when he talks about risk, capital, or feeling rushed.
+   - For example, remind him that a calm monthly return close to his "safe monthly return percent"
+     can already cover his living costs, so he doesn't need to gamble today.
    - Avoid generic speeches; stay tightly connected to his actual question and context.
 
 MATH & LISTENING PROTOCOL (STRICT):
-- ALWAYS extract the key numbers the user gives and answer with raw calculation first, followed by a tiny breakdown and optional short coaching.
+
+1) ALWAYS extract the key numbers the user gives:
+   - account size(s)
+   - profit/loss amounts
+   - target percentages
+   - evaluation rules (daily max loss, total max loss, target, etc.)
+
+2) DIRECT QUESTIONS REQUIRE DIRECT ANSWERS:
+   - If the user gives numbers or asks "how much", "how many", 
+     "what percent", "how far from target", ALWAYS answer with the 
+     raw calculation FIRST.
+   - Format answers like this:
+       • Result summary (1 line)
+       • Tiny breakdown (1–2 lines max)
+       • Then OPTIONAL coaching (1 line max)
+
+3) NEVER GUESS NUMBERS.
+   - If something is unclear, ask ONE clarifying question.
+   - DO NOT assume the initial capital if the user did not say it.
+
+4) WHEN THE USER PROVIDES A CORRECTION:
+   - Immediately apologize briefly.
+   - Restate the corrected numbers.
+   - Recalculate CORRECTLY.
+   - Provide the clean updated answer BEFORE ANY coaching.
+
+5) COACHING RULE:
+   - Coaching must always come AFTER the numeric answer.
+   - Coaching must be short (1–2 lines max).
+   - Coaching MUST relate directly to the user's numbers and goal.
+   - DO NOT give generic lectures.
+
+6) STRICT PRIORITY ORDER:
+   (1) Listen and extract numbers  
+   (2) Compute  
+   (3) Present result  
+   (4) Optional coaching  
+
+Your job: be a sharp, numbers-accurate trading partner AND a disciplined, caring coach.
+Use the Knowledge Center rules as the user's personal doctrine whenever relevant.
 `.trim();
 
     const userMessageForModel = `[sent_at: ${sentAtIso}] ${userText}`;
 
-    // --- 4) Call Groq LLM for normal chat path ---
     const completion = await groqClient.chat.completions.create({
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: [
         { role: "system", content: systemPrompt },
-        ...historyMessages,
         { role: "user", content: userMessageForModel },
       ],
       stream: false,
@@ -478,22 +444,10 @@ MATH & LISTENING PROTOCOL (STRICT):
 
     const replyText = stripSentAtPrefix(rawReply);
 
+    // send text + voice
     await sendTelegramText(chatId, replyText);
-
     const audio = await synthesizeTTS(replyText);
     if (audio) await sendTelegramVoice(chatId, audio);
-
-    // --- Save to shared history (preserve OLD behavior) ---
-    try {
-      await saveHistoryPair({
-        supabase,
-        channel: "telegram",
-        userText: userMessageForModel,
-        assistantText: replyText,
-      });
-    } catch (e) {
-      console.error("Error saving chat reply to history:", e);
-    }
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
