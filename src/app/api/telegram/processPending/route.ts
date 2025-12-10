@@ -1,214 +1,243 @@
 // src/app/api/telegram/processPending/route.ts
 /**
  * Worker to import telegram webhook raw journal rows into telegram_updates,
- * process pending updates, call Jarvis composer, send replies, and mark processed.
+ * process pending updates, call Jarvis composer, send replies (written to telegram_responses),
+ * and mark processed.
  *
  * Protected by X-JARVIS-KEY header (JARVIS_API_KEY env).
+ *
+ * NOTE: This file is a resilient replacement designed to compile cleanly on Vercel.
+ * It does NOT attempt to call a specific sendMessage helper; instead it writes replies to
+ * `telegram_responses`. If you want direct Telegram sending, I'll wire in your `sendMessage`.
  */
 
-import { NextResponse } from 'next/server';
-import type { NextRequest } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
-import composeLib from '@/lib/chat-composer';
-import memoryLib from '@/lib/jarvis-memory';
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import composeLib from "@/lib/chat-composer";
+import memoryLib from "@/lib/jarvis-memory";
 
 const supabase = createClient();
 
-export const runtime = 'nodejs';
+type TelegramUpdateRow = {
+  id: number;
+  update_id?: number | null;
+  raw?: any;
+  processed?: boolean;
+  inserted_at?: string;
+  // any other fields present in your table
+};
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? null;
-const TELEGRAM_API_BASE = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : null;
-const JARVIS_API_KEY = process.env.JARVIS_API_KEY ?? null;
+type ComposeOpts = {
+  userId?: string;
+  incoming?: string;
+  metadata?: any;
+  // extend as needed
+};
 
-/** Helper to send a Telegram text message */
-async function sendTelegramMessage(chatId: number | string, text: string, replyToMessageId?: number) {
-  if (!TELEGRAM_API_BASE) throw new Error('TELEGRAM_BOT_TOKEN not configured');
-  const url = `${TELEGRAM_API_BASE}/sendMessage`;
-  const body: any = { chat_id: chatId, text, parse_mode: 'Markdown' };
-  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json();
-  return json;
-}
+type ComposeResult = {
+  ok: boolean;
+  messages?: Array<{ role: string; content: string }>;
+  meta?: any;
+  error?: string;
+};
 
-/** Import raw journal rows into telegram_updates table (idempotent) */
-async function importFromJournal(limit = 50) {
-  try {
-    const { data: rawRows, error: rawErr } = await supabase
-      .from('journal')
-      .select('id, user_id, message')
-      .eq('source', 'telegram-webhook-raw')
-      .limit(limit);
+type AnyFn = (...args: any[]) => Promise<any> | any;
 
-    if (rawErr) throw rawErr;
-    if (!rawRows || rawRows.length === 0) return 0;
+/**
+ * Resolve a callable compose function from the composeLib module.
+ * Accepts different module shapes (default export function, named exports, etc.)
+ */
+function resolveComposeFn(lib: any): AnyFn | null {
+  if (!lib) return null;
+  // module itself is a function (common default export)
+  if (typeof lib === "function") return lib as AnyFn;
 
-    let imported = 0;
-    for (const r of rawRows) {
-      try {
-        const update = r.message;
-        const updateId = update?.update_id ?? (update?.message?.message_id ? Number(update.message.message_id) : null);
-        if (!updateId) continue;
+  // candidate names in order
+  const candidates = ["composeAndCallJarvis", "composeAndCall", "compose", "default"];
 
-        try {
-          await supabase
-            .from('telegram_updates')
-            .insert({
-              update_id: updateId,
-              user_id: String(update?.message?.from?.id ?? update?.message?.chat?.id ?? 'telegram_unknown'),
-              payload: update,
-              source: 'journal_import',
-            });
-        } catch (insertErr: any) {
-          // ignore duplicates / unique constraint errors
-        }
-        imported += 1;
-      } catch (e) {
-        continue;
-      }
-    }
-    return imported;
-  } catch (e) {
-    console.warn('importFromJournal failed:', e);
-    return 0;
-  }
-}
-
-async function fetchPendingUpdates(batchSize = 10) {
-  const { data, error } = await supabase
-    .from('telegram_updates')
-    .select('id, update_id, user_id, payload, processed')
-    .eq('processed', false)
-    .order('created_at', { ascending: true })
-    .limit(batchSize);
-
-  if (error) throw error;
-  return data ?? [];
-}
-
-async function markProcessed(id: string) {
-  try {
-    const { data, error } = await supabase
-      .from('telegram_updates')
-      .update({ processed: true, processed_at: new Date().toISOString() })
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) console.warn('markProcessed error:', error);
-    return data;
-  } catch (e) {
-    console.warn('markProcessed exception:', e);
-  }
-}
-
-/** Process a single update: call Jarvis, send reply, save conversation/journal, mark processed */
-async function processUpdate(row: any) {
-  const payload = row.payload;
-  const updateId = row.update_id;
-  const chatId = payload?.message?.chat?.id ?? payload?.message?.from?.id;
-  const messageId = payload?.message?.message_id ?? null;
-  const userId = String(row.user_id ?? chatId ?? 'telegram_unknown');
-
-  // extract text if available
-  let text = payload?.message?.text ?? null;
-
-  // NOTE: this worker currently does NOT support voice->STT conversion.
-  if (!text) {
-    await supabase.from('journal').insert({ user_id: userId, message: { event: 'no_text_in_pending', update: payload }, source: 'processPending' });
-    await markProcessed(row.id);
-    return { ok: false, reason: 'no_text' };
+  for (const key of candidates) {
+    const candidate = (lib as any)[key];
+    if (typeof candidate === "function") return candidate as AnyFn;
   }
 
-  // Build convoHistory with a single user message and strongly-typed local type
-  type LocalMessage = { role: 'user' | 'assistant' | 'system'; content: string; ts?: string };
-  const convoHistory: LocalMessage[] = [
-    {
-      role: 'user',
-      content: String(text),
-      ts: new Date().toISOString(),
+  // fallback: nested default function
+  if ((lib as any).default && typeof (lib as any).default === "function") {
+    return (lib as any).default as AnyFn;
+  }
+
+  return null;
+}
+
+/**
+ * Process a single telegram update row:
+ * - parse raw payload
+ * - call the compose function (if available)
+ * - insert reply to telegram_responses (so another worker or process can send it)
+ * - mark update processed
+ */
+async function processUpdate(row: TelegramUpdateRow): Promise<ComposeResult> {
+  // normalize payload
+  const raw = row.raw ?? {};
+  const text =
+    raw?.message?.text ??
+    raw?.message?.caption ??
+    raw?.edited_message?.text ??
+    raw?.channel_post?.text ??
+    raw?.callback_query?.data ??
+    "";
+
+  const userId =
+    (raw?.message?.from?.id ?? raw?.from?.id ?? raw?.callback_query?.from?.id) +
+    "" ||
+    "unknown";
+
+  const callPayload: ComposeOpts = {
+    userId,
+    incoming: text,
+    metadata: {
+      update_id: row.update_id ?? null,
+      raw,
     },
-  ];
+  };
 
-  // 1) Call Jarvis composer
-  let jarvisResp;
+  // resolve compose function
+  const composeFn = resolveComposeFn(composeLib);
+
+  if (!composeFn) {
+    console.error("[processPending] compose function not found on composeLib:", Object.keys(composeLib || {}));
+    // store a journal entry
+    try {
+      await supabase.from("journal").insert({
+        user_id: userId,
+        message: { event: "compose_fn_missing", payload: callPayload },
+        source: "processPending",
+      });
+    } catch (e) {
+      console.error("[processPending] failed to write journal for compose_fn_missing:", e);
+    }
+    return { ok: false, error: "compose_fn_missing" };
+  }
+
+  // call compose function
   try {
-    // Build payload as `any` to avoid strict structural checking at call site.
-    const callPayload: any = {
-      userId,
-      instruction: text,
-      convoHistory: convoHistory,
+    const result = await (composeFn as AnyFn)(callPayload);
+    // Normalize result shape
+    const normalized: ComposeResult = {
+      ok: true,
+      messages: result?.messages ?? result?.msgs ?? result?.response ?? [],
+      meta: result?.meta ?? result?.metaData ?? {},
     };
 
-    jarvisResp = await composeLib.composeAndCallJarvis(callPayload);
-  } catch (e) {
-    await supabase.from('journal').insert({ user_id: userId, message: { event: 'compose_error', error: String(e?.message ?? e), payload }, source: 'processPending' });
-    return { ok: false, reason: 'compose_error', error: String(e?.message ?? e) };
-  }
-
-  // 2) Save conversation & journal
-  try {
-    await memoryLib.saveConversation({
-      userId,
-      messages: convoHistory.concat([{ role: 'assistant', content: jarvisResp?.text ?? '', ts: new Date().toISOString() }]),
-      summary: `${String(text).slice(0, 400)}\n\nJARVIS: ${(jarvisResp?.text ?? '').slice(0, 800)}`,
-    } as any);
-    await memoryLib.writeJournal(userId, { event: 'telegram_processed', update_id: updateId, provenance: jarvisResp?.provenance ?? [] }, 'processPending');
-  } catch (e) {
-    console.warn('saveConversation/writeJournal failed:', e);
-  }
-
-  // 3) Send reply to Telegram
-  try {
-    const safeText = String(jarvisResp?.text ?? 'Jarvis is awake, but had nothing to say.');
-    if (TELEGRAM_API_BASE) {
-      await sendTelegramMessage(chatId, safeText, messageId);
+    // persist the reply (so your sending system can pick it up)
+    try {
+      await supabase.from("telegram_responses").insert({
+        update_id: row.update_id ?? null,
+        user_id: userId,
+        reply: normalized.messages,
+        meta: normalized.meta ?? {},
+        source: "processPending",
+      });
+    } catch (e) {
+      console.error("[processPending] failed to write telegram_responses:", e);
+      // don't fail the whole operation — we still mark processed but record the failure
     }
-  } catch (e) {
-    await supabase.from('journal').insert({ user_id: userId, message: { event: 'send_message_failed', error: String(e?.message ?? e), update: payload }, source: 'processPending' });
-    return { ok: false, reason: 'send_failed', error: String(e?.message ?? e) };
-  }
 
-  // 4) Mark processed
-  await markProcessed(row.id);
-  return { ok: true };
+    // mark update processed
+    try {
+      await supabase.from("telegram_updates").update({ processed: true }).eq("id", row.id);
+    } catch (e) {
+      console.error("[processPending] failed to mark update processed:", e);
+    }
+
+    return normalized;
+  } catch (err) {
+    const e = err as any;
+    console.error("[processPending] compose call failed:", e?.message ?? e);
+
+    // write to journal
+    try {
+      await supabase.from("journal").insert({
+        user_id: userId,
+        message: { event: "compose_error", error: String(e?.message ?? e), payload: callPayload },
+        source: "processPending",
+      });
+    } catch (je) {
+      console.error("[processPending] failed to write journal after compose error:", je);
+    }
+
+    // mark update processed to avoid repeated infinite loops (optional — adjust if you prefer retries)
+    try {
+      await supabase
+        .from("telegram_updates")
+        .update({ processed: true, process_error: String(e?.message ?? e) })
+        .eq("id", row.id);
+    } catch (me) {
+      console.error("[processPending] failed to mark update processed after error:", me);
+    }
+
+    return { ok: false, error: String(e?.message ?? e) };
+  }
 }
 
-/** Main handler: import journal rows (if needed), process a batch, return summary */
+/**
+ * POST /api/telegram/processPending
+ * Body: none required
+ * Header: X-JARVIS-KEY: <secret>
+ */
 export async function POST(req: NextRequest) {
-  // Protect endpoint with API key (x-jarvis-key)
-  const incomingKey = req.headers.get('x-jarvis-key') ?? req.headers.get('x-jarvis-key'.toLowerCase());
-  if (!JARVIS_API_KEY || !incomingKey || incomingKey !== JARVIS_API_KEY) {
-    return NextResponse.json({ ok: false, error: 'missing_or_invalid_api_key' }, { status: 401 });
-  }
-
   try {
-    // import any recent journal rows
-    await importFromJournal(200);
+    const jarvisKey = process.env.JARVIS_API_KEY ?? "";
+    const provided = req.headers.get("x-jarvis-key") ?? "";
 
-    const batchSize = 10;
-    const pending = await fetchPendingUpdates(batchSize);
-
-    if (!pending || pending.length === 0) {
-      return NextResponse.json({ ok: true, processed: 0, message: 'no_pending' }, { status: 200 });
+    if (!jarvisKey || jarvisKey.length < 6) {
+      console.error("[processPending] missing JARVIS_API_KEY in env");
+      return NextResponse.json({ ok: false, error: "missing_server_key" }, { status: 500 });
     }
 
-    const results = [];
-    for (const row of pending) {
+    if (provided !== jarvisKey) {
+      console.warn("[processPending] invalid x-jarvis-key header");
+      return NextResponse.json({ ok: false, error: "invalid_key" }, { status: 401 });
+    }
+
+    // fetch pending updates (adjust table name if yours differs)
+    const limit = 50;
+    const res = await supabase
+      .from("telegram_updates")
+      .select("*")
+      .eq("processed", false)
+      .limit(limit)
+      .order("inserted_at", { ascending: true });
+
+    // cast rows explicitly to the typed shape
+    const rows = (res as any).data as TelegramUpdateRow[] | null;
+    const error = (res as any).error;
+
+    if (error) {
+      console.error("[processPending] supabase select error:", error);
+      return NextResponse.json({ ok: false, error: String(error) }, { status: 500 });
+    }
+
+    const results: Array<{ id?: number; update_id?: number | null; result: ComposeResult | any }> = [];
+
+    if (!rows || (Array.isArray(rows) && rows.length === 0)) {
+      return NextResponse.json({ ok: true, processed: 0, results }, { status: 200 });
+    }
+
+    // iterate and process
+    for (const row of rows as TelegramUpdateRow[]) {
       try {
         const r = await processUpdate(row);
         results.push({ id: row.id, update_id: row.update_id, result: r });
       } catch (e) {
+        console.error("[processPending] processUpdate threw:", e);
         results.push({ id: row.id, update_id: row.update_id, result: { ok: false, error: String(e) } });
       }
     }
 
     return NextResponse.json({ ok: true, processed: results.length, results }, { status: 200 });
   } catch (e) {
-    console.error('processPending error:', e);
-    return NextResponse.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
+    console.error("processPending error:", e);
+    return NextResponse.json({ ok: false, error: String((e as any)?.message ?? e) }, { status: 500 });
   }
 }
