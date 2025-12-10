@@ -1,39 +1,51 @@
 // src/lib/telegram.ts
-// sendToTelegram helper used by api/telegram route.
-// Exports named function sendToTelegram(chatId, text) and default export for backward compatibility.
+import fetch from "node-fetch";
 
-export async function sendToTelegram(chatId: string | number, text: string, opts?: { parseMode?: "Markdown" | "HTML" }) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!BOT_TOKEN) {
-    console.warn("sendToTelegram: TELEGRAM_BOT_TOKEN missing");
-    throw new Error("Missing TELEGRAM_BOT_TOKEN env var");
+/**
+ * Minimal Telegram helper using bot token from env.
+ * Exports:
+ *  - sendMessage(chatId, text, options) -> { ok, result }
+ *  - setWebhook(webhookUrl) -> { ok, result }
+ */
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!TELEGRAM_TOKEN) {
+  console.warn("[telegram] TELEGRAM_BOT_TOKEN is not set in env.");
+}
+
+const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+
+async function callTelegramMethod(method: string, body: any) {
+  if (!TELEGRAM_TOKEN) {
+    return { ok: false, error: "missing TELEGRAM_BOT_TOKEN" };
   }
-
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const body: any = {
-    chat_id: chatId,
-    text: String(text),
-  };
-
-  if (opts?.parseMode) body.parse_mode = opts.parseMode;
-
+  const url = `${TELEGRAM_API_BASE}/${method}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    console.warn("sendToTelegram failed:", res.status, txt);
-    throw new Error(`sendToTelegram failed: ${res.status} ${txt}`);
-  }
-
-  const json = await res.json();
-  return json;
+  const data = await res.json().catch(() => ({ ok: false, error: "invalid-json" }));
+  return data;
 }
 
-// For older callers importing default
-export default {
-  sendToTelegram,
-};
+export async function sendMessage(chatId: number | string, text: string, opts: any = {}) {
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: opts.parse_mode || "Markdown",
+    reply_markup: opts.reply_markup,
+    disable_notification: opts.disable_notification,
+  };
+  return callTelegramMethod("sendMessage", body);
+}
+
+export async function setWebhook(webhookUrl: string) {
+  return callTelegramMethod("setWebhook", { url: webhookUrl });
+}
+
+export async function deleteWebhook() {
+  return callTelegramMethod("deleteWebhook", {});
+}
+
+export default { sendMessage, setWebhook, deleteWebhook };
