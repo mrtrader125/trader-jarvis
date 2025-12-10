@@ -1,150 +1,101 @@
 // src/lib/chat-composer.ts
-/**
- * chat-composer.ts
- *
- * Composes prompt for Jarvis, fetches memory context, and calls Groq LLM.
- * - Robust wrapper for groqClient (tries several common method names)
- * - Uses memoryLib.getRelevantMemories (positional args)
- * - Runs deterministic math post-processing via mathEngine
- *
- * Exports:
- *  - composeAndCallJarvis({ userId, instruction, convoHistory })
- */
+// Robust chat composer for Jarvis.
+// - Default export composes messages for the LLM
+// - Uses memoryLib safely (supports getRelevantMemories, fetchRelevantMemories, fetchMemoryForUser)
+// - Uses jarvisPersona and mathEngine if present
+// - Defensive / TypeScript-friendly
 
-import { groqClient } from '@/lib/groq';
-import jarvisPersona from '@/lib/jarvis-persona';
-import memoryLib from '@/lib/jarvis-memory';
-import mathEngine from '@/lib/math-engine';
+import { groqClient } from "@/lib/groq";
+import jarvisPersona from "@/lib/jarvis-persona";
+import * as memoryLibImport from "./jarvis-memory";
+import * as mathEngine from "./math-engine";
 
-type Message = { role: 'user' | 'assistant' | 'system'; content: string; ts?: string };
+type Role = "user" | "assistant" | "system";
+type Msg = { role: Role; content: string; ts?: string };
 
-type ComposeArgs = {
+type ComposeOpts = {
   userId: string;
-  instruction: string;
-  convoHistory?: Message[];
+  messages?: Msg[]; // conversation messages (most recent last)
   memoryLimit?: number;
+  memoryMaxAgeDays?: number;
+  verbose?: boolean;
 };
 
-const DEFAULT_MEMORY_LIMIT = 6;
-
-/** Helper: resilient Groq client caller */
-async function callGroqClient(prompt: string, opts: { temperature?: number; max_tokens?: number } = {}) {
-  const anyClient = groqClient as any;
-
-  // Try common method names used by various wrappers
-  const attempts = ['call', 'request', 'generate', 'run', 'invoke', 'complete'];
-
-  for (const m of attempts) {
-    if (typeof anyClient[m] === 'function') {
-      try {
-        return await anyClient[m]({ prompt, ...opts });
-      } catch (e) {
-        // if method exists but fails, rethrow (we want the real error)
-        throw e;
-      }
-    }
-  }
-
-  // If client provides a function that accepts (prompt) directly as default export
-  if (typeof anyClient === 'function') {
-    try {
-      return await anyClient(prompt, opts);
-    } catch (e) {
-      throw e;
-    }
-  }
-
-  // Nothing matched — throw helpful error
-  throw new Error(
-    'groqClient does not expose a known call method. Expected one of: call/request/generate/run/invoke/complete or a default function. Please adapt groq client wrapper to expose a callable method.'
-  );
-}
-
-/** Build prompt from persona + memory + convo */
-async function buildPrompt(userId: string, instruction: string, convoHistory: Message[], memoryLimit = DEFAULT_MEMORY_LIMIT) {
-  const system = jarvisPersona.buildSystemPrompt();
-
-  // fetch memories (positional args: userId, tagFilter, daysRange, limit)
-  const memRows = await memoryLib.getRelevantMemories(userId, null, null, memoryLimit);
-
-  const memoryTexts = memRows.map((m: any) => {
-    if (!m) return '';
-    if (typeof m.content === 'string') return m.content;
-    if (m.title && !m.content) return String(m.title);
-    if (m.content && typeof m.content === 'object') {
-      return m.content.text ?? m.content.body ?? m.content.note ?? m.title ?? JSON.stringify(m.content);
-    }
-    return String(m.content ?? m.title ?? '');
+function normalizeMessages(input?: Msg[] | { role: string; content: string }[]) {
+  if (!input || !Array.isArray(input)) return [];
+  return input.map((m) => {
+    // coerce role to allowed union; default to 'user' if unknown
+    const role = (m as any).role;
+    const safeRole: Role = role === "assistant" || role === "system" ? (role as Role) : "user";
+    return { role: safeRole, content: String((m as any).content ?? ""), ts: (m as any).ts };
   });
-
-  const historyText = (convoHistory || [])
-    .slice(-6)
-    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
-    .join('\n');
-
-  const parts = [
-    system,
-    '\n\n-- Retrieved memories (most recent first) --\n' + (memoryTexts.length ? memoryTexts.join('\n---\n') : 'No relevant memory found.'),
-    '\n\n-- Recent session --\n' + (historyText || 'No recent messages.'),
-    '\n\n-- User instruction --\n' + instruction,
-    '\n\n-- Rules --\nAlways use deterministic math engine for numeric calcs.',
-  ];
-
-  return parts.join('\n\n');
 }
 
-/** Evaluate LLM output for deterministic embedded calculations like [[calc:1+2]] */
-function postProcessLLMText(rawText: string) {
-  let text = String(rawText ?? '');
-
-  // Replace [[calc:EXPR]] with evaluated deterministic result
-  text = text.replace(/\[\[calc:([^\]]+)\]\]/g, (m, expr) => {
-    try {
-      const val = (mathEngine && typeof mathEngine.evaluateExpression === 'function')
-        ? mathEngine.evaluateExpression(String(expr).trim())
-        : null;
-      return val === null || val === undefined ? `[calc_error]` : String(val);
-    } catch (e) {
-      return `[calc_error:${String(e?.message ?? e)}]`;
-    }
-  });
-
-  return text;
-}
-
-/** Main composer: builds prompt, calls LLM, post-processes */
-export async function composeAndCallJarvis(opts: ComposeArgs) {
-  const { userId, instruction, convoHistory = [], memoryLimit = DEFAULT_MEMORY_LIMIT } = opts;
-
-  const prompt = await buildPrompt(userId, instruction, convoHistory, memoryLimit);
-
-  // Call Groq client using resilient wrapper
-  let llmResp: any;
+// pick the best memory fetch function available
+const memoryLib: any = (memoryLibImport as any).default ?? memoryLibImport;
+async function fetchRelevant(userId: string, memoryLimit = 6, maxAgeDays?: number) {
   try {
-    llmResp = await callGroqClient(prompt, { temperature: 0.0, max_tokens: 800 });
+    if (!memoryLib) return [];
+    // prefer getRelevantMemories alias if available
+    if (typeof memoryLib.getRelevantMemories === "function") {
+      return await memoryLib.getRelevantMemories(userId, null, maxAgeDays ?? null, memoryLimit);
+    }
+    if (typeof memoryLib.fetchRelevantMemories === "function") {
+      return await memoryLib.fetchRelevantMemories(userId, null, maxAgeDays ?? null, memoryLimit);
+    }
+    if (typeof memoryLib.fetchMemoryForUser === "function") {
+      return await memoryLib.fetchMemoryForUser(userId, { limit: memoryLimit });
+    }
+    return [];
   } catch (e) {
-    throw new Error('LLM call failed: ' + String(e?.message ?? e));
+    console.warn("fetchRelevant memory error:", e);
+    return [];
   }
-
-  // Normalize response text
-  let text = '';
-  if (typeof llmResp === 'string') {
-    text = llmResp;
-  } else if (llmResp && typeof llmResp === 'object') {
-    // Common shapes: { text }, { output }, { choices: [{ text }] }, { result }
-    text = llmResp.text ?? llmResp.output ?? (llmResp.choices?.[0]?.text) ?? llmResp.result ?? JSON.stringify(llmResp);
-  } else {
-    text = String(llmResp);
-  }
-
-  // Post-process deterministic calculations
-  text = postProcessLLMText(text);
-
-  const provenance = llmResp?.provenance ?? llmResp?.sources ?? [];
-
-  return { text, raw: llmResp, provenance };
 }
 
-export default {
-  composeAndCallJarvis,
-};
+function buildMemoryPreface(memRows: any[]) {
+  if (!memRows || memRows.length === 0) return "";
+  // Defensive: each row may have summary or data.summary or summary in data
+  const lines = memRows.map((m: any, i: number) => {
+    const summary =
+      m?.summary ??
+      (m?.data && (m.data.summary || m.data.text || m.data.note)) ??
+      (typeof m === "string" ? m : JSON.stringify(m).slice(0, 200));
+    return `${i + 1}. ${String(summary).replace(/\s+/g, " ").trim()}`;
+  });
+  return `Relevant memories (most relevant first):\n${lines.join("\n")}\n\n`;
+}
+
+function buildSystemPrompt(userId: string, memoryPreface: string) {
+  const personaText =
+    (jarvisPersona && (jarvisPersona as any).summary) ||
+    (jarvisPersona && typeof jarvisPersona === "string" ? jarvisPersona : null) ||
+    "You are Jarvis, a concise, factual trading assistant. Speak clearly and helpfully.";
+  const now = new Date().toISOString();
+  return `${personaText}\nUser: ${userId}\nTime: ${now}\n\n${memoryPreface}Respond concisely and with numeric accuracy when relevant.`;
+}
+
+export default async function composeChat(opts: ComposeOpts) {
+  const userId = opts.userId;
+  const memoryLimit = opts.memoryLimit ?? 6;
+  const maxAgeDays = opts.memoryMaxAgeDays;
+
+  const convo = normalizeMessages(opts.messages);
+  // fetch relevant memories
+  const memRows = await fetchRelevant(userId, memoryLimit, maxAgeDays);
+  const memoryPreface = buildMemoryPreface(memRows);
+
+  const systemPrompt = buildSystemPrompt(userId, memoryPreface);
+
+  // final composed messages: system prompt, then the recent convo (limit last 12 msgs)
+  const recent = convo.slice(-12).map((m) => ({ role: m.role, content: m.content }));
+  const composed: Msg[] = [{ role: "system", content: systemPrompt }, ...recent];
+
+  return {
+    messages: composed,
+    meta: {
+      memoryCount: Array.isArray(memRows) ? memRows.length : 0,
+      memoryRows: memRows,
+    },
+  };
+}
