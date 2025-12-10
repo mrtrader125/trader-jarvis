@@ -1,6 +1,6 @@
 // src/lib/jarvis-memory.ts
 // Unified memory helper for Jarvis.
-// - Named exports: fetchMemoryForUser, fetchRelevantMemories, saveMemory, saveConversation, writeJournal
+// - Named exports: fetchMemoryForUser, fetchRelevantMemories, getRelevantMemories, saveMemory, saveConversation, writeJournal
 // - Default export: memoryLib { ... }
 // Server-only helpers using Supabase server client.
 
@@ -23,7 +23,7 @@ export type ConversationMessage = {
 };
 
 /* -------------------------
-   Basic memory functions
+   fetchMemoryForUser
    ------------------------- */
 
 export async function fetchMemoryForUser(
@@ -68,7 +68,7 @@ export async function fetchMemoryForUser(
 }
 
 /* -------------------------
-   Flexible relevant-memory fetcher
+   fetchRelevantMemories (flexible)
    ------------------------- */
 
 export async function fetchRelevantMemories(
@@ -156,6 +156,20 @@ export async function fetchRelevantMemories(
 }
 
 /* -------------------------
+   getRelevantMemories (alias)
+   ------------------------- */
+
+/**
+ * Backwards-compatible alias expected by some callers.
+ * Simply forwards to fetchRelevantMemories.
+ */
+export async function getRelevantMemories(
+  ...args: Parameters<typeof fetchRelevantMemories>
+) {
+  return fetchRelevantMemories(...args);
+}
+
+/* -------------------------
    saveMemory
    ------------------------- */
 
@@ -186,7 +200,7 @@ export async function saveMemory(userId: string, payload: { summary: string; dat
 
 export async function saveConversation(payload: {
   userId: string;
-  messages: ConversationMessage[];
+  messages: ConversationMessage[] | any[];
   summary?: string;
   meta?: any;
 }) {
@@ -232,10 +246,8 @@ export async function writeJournal(userId: string, payload: any, source?: string
       created_at: new Date().toISOString(),
     };
 
-    // Primary table name 'journal'
     let res = await supabase.from("journal").insert([row]);
     if (res.error) {
-      // fallback to 'jarvis_journal'
       console.warn("writeJournal: insert to 'journal' failed, trying 'jarvis_journal'", res.error);
       const res2 = await supabase.from("jarvis_journal").insert([row]);
       if (res2.error) {
@@ -258,6 +270,7 @@ export async function writeJournal(userId: string, payload: any, source?: string
 const memoryLib = {
   fetchMemoryForUser,
   fetchRelevantMemories,
+  getRelevantMemories,
   saveMemory,
   saveConversation,
   writeJournal,
