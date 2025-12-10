@@ -48,9 +48,24 @@ export async function POST(req: NextRequest) {
         userId,
       });
 
-      if (typeof reply === "string") finalText = reply;
-      else if (reply?.text) finalText = reply.text;
-      else finalText = String(reply ?? finalText);
+      // Safe normalization: check shapes before accessing .text
+      if (typeof reply === "string") {
+        finalText = reply;
+      } else if (reply && typeof reply === "object") {
+        // If it has a 'text' property that's a string, use it.
+        if ("text" in reply && typeof (reply as any).text === "string") {
+          finalText = (reply as any).text;
+        } else if ("reply" in reply && typeof (reply as any).reply === "string") {
+          finalText = (reply as any).reply;
+        } else if ("message" in reply && typeof (reply as any).message === "string") {
+          finalText = (reply as any).message;
+        } else {
+          // fallback to stringifying the object (safe)
+          finalText = JSON.stringify(reply);
+        }
+      } else {
+        finalText = String(reply ?? finalText);
+      }
     } catch (err) {
       console.warn("handleIncomingChat failed:", err);
       finalText =
@@ -90,8 +105,8 @@ export async function POST(req: NextRequest) {
       ];
 
       // Save conversation
-      if (typeof memoryLib.saveConversation === "function") {
-        await memoryLib.saveConversation({
+      if (typeof (memoryLib as any).saveConversation === "function") {
+        await (memoryLib as any).saveConversation({
           userId,
           messages: convo,
           summary: `${String(text).slice(0, 400)}\n\nJARVIS: ${(
@@ -101,8 +116,8 @@ export async function POST(req: NextRequest) {
       }
 
       // Save journal event
-      if (typeof memoryLib.writeJournal === "function") {
-        await memoryLib.writeJournal(
+      if (typeof (memoryLib as any).writeJournal === "function") {
+        await (memoryLib as any).writeJournal(
           userId,
           {
             event: "telegram_processed",
